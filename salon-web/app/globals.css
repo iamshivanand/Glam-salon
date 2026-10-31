@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 253 251 247;
+  --surface: 255 255 255;
+  --muted: 244 238 230;
+}
+.dark {
+  --bg: 18 17 16;
+  --surface: 30 28 26;
+  --muted: 38 34 32;
+}
+
+body { @apply bg-background text-ink dark:text-[#F5F1EB] font-body antialiased; }
+.font-display { font-family: Fraunces, Georgia, serif; }
+.card { @apply bg-surface border border-line dark:border-white/10 rounded-[22px] shadow-[0_10px_40px_-15px_rgba(45,27,46,0.25)]; }
+.btn-primary { @apply bg-primary text-white dark:bg-[#E9DCC8] dark:text-black rounded-full px-6 py-3 font-medium hover:opacity-90 transition; }
+.btn-accent { @apply bg-accent text-[#2D1B2E] rounded-full px-6 py-3 font-medium hover:brightness-105 transition; }
+.chip { @apply px-4 py-2 rounded-full border border-line text-sm hover:border-accent transition cursor-pointer; }
+.chip-active { @apply bg-primary text-white border-primary; }
+.slot { @apply px-3 py-2 rounded-xl border text-sm text-center cursor-pointer transition; }
+.slot-on { @apply border-accent bg-accent/15 font-semibold; }
+.slot-off { @apply opacity-35 line-through cursor-not-allowed; }

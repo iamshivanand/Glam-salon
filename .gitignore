@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# builds
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# env — keep the examples, ignore real config
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# mobile
+.expo/
+.expo-shared/
