@@ -10,7 +10,7 @@ Salon/
 ├─ salon-api/             Fastify 5 + pg + Redis API, SQL migrations, seed, smoke test
 ├─ salon-web/             Next.js 14 app — customer booking flow and owner console
 ├─ salon-contracts/       Shared TypeScript types (package: @glamconnect/contracts)
-└─ salon-mobile/          Expo prototype (still on local mock data)
+└─ salon-mobile/          Expo app wired to the same API (customer booking + owner console)
 ```
 
 ## Quick start
@@ -30,6 +30,12 @@ cd salon-web
 Copy-Item .env.local.example .env.local
 npm install
 npm run dev            # http://localhost:3000
+
+# optional: Expo app (needs the API above)
+cd ..\salon-mobile
+Copy-Item .env.example .env
+npm install
+npx expo start
 ```
 
 Verify the backend:
@@ -64,7 +70,8 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 
 Implemented and verified: OTP auth, discovery search, availability, 5-minute slot holds,
 booking lifecycle, POS invoicing with GST and commission split, salon CRM, retention
-reminder scheduling, walk-in queue, reviews, admin KYC/commission management.
+reminder scheduling, walk-in queue, reviews, admin KYC/commission management. The web app
+and the Expo app both run against the live API.
 
 Not implemented (external integrations by design): OpenSearch, BullMQ/n8n workers, actual
 WhatsApp/SMS delivery, S3 uploads and the payment gateway.
