@@ -131,6 +131,11 @@ async function main() {
 
   // Reminder delivery: consent is checked, the provider is called, and the row
   // carries a provider receipt. CI runs with the console provider.
+  //
+  // The background interval dispatcher may win the Redis lock between the insert
+  // and the trigger's immediate dispatch, so poll for the new row instead of
+  // requiring this request to be the one that sent it.
+  const knownReminderIds = new Set(reminders.reminders.map((r: any) => r.id));
   const sentReminder = await call<any>('/partner/reminders/trigger', {
     method: 'POST',
     token: owner.access_token,
@@ -140,15 +145,25 @@ async function main() {
       template_code: 'DAY_25_INVITE',
     },
   });
-  ok('reminder delivery', `queued ${sentReminder.enqueued} · sent ${sentReminder.sent}`);
-  if (sentReminder.sent !== 1) throw new Error('reminder was not delivered through the provider');
-
-  const afterReminders = await call<any>('/partner/reminders', { token: owner.access_token });
-  const delivered = afterReminders.reminders.find(
-    (r: any) => r.customer_id === customer.user.id && r.status === 'SENT' && r.provider_message_id,
+  ok(
+    'reminder delivery',
+    `queued ${sentReminder.enqueued} · sent ${sentReminder.sent}${sentReminder.failed ? ` · failed ${sentReminder.failed}` : ''}`,
   );
+
+  let delivered: any = null;
+  for (let attempt = 0; attempt < 12 && !delivered; attempt += 1) {
+    const afterReminders = await call<any>('/partner/reminders', { token: owner.access_token });
+    delivered = afterReminders.reminders.find(
+      (r: any) =>
+        !knownReminderIds.has(r.id) &&
+        r.customer_id === customer.user.id &&
+        r.status === 'SENT' &&
+        r.provider_message_id,
+    );
+    if (!delivered) await new Promise((resolve) => setTimeout(resolve, 500));
+  }
   ok('reminder provider receipt', delivered?.provider_message_id ?? 'missing');
-  if (!delivered) throw new Error('delivered reminder has no provider_message_id');
+  if (!delivered) throw new Error('reminder was not delivered through the provider');
 
   const consentBlocked = await call<any>('/partner/reminders/trigger', {
     method: 'POST',
