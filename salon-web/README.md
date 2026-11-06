@@ -46,12 +46,17 @@ code and the modal fills it in for you.
 | `/`                | Live discovery near Indiranagar, salon cards, popular services, artists, reviews |
 | `/services`        | Full catalogue for the selected salon, grouped by category, add to booking    |
 | `/book`            | 3-step flow: services → artist/date/time → confirm (OTP gate + 5-min hold)    |
-| `/appointments`    | Customer booking history, statuses, cancel, check-in PIN on confirmation      |
+| `/appointments`    | Customer booking history, statuses, cancel, check-in PIN, post-visit reviews  |
 | `/admin`           | Partner overview: revenue, retention, reminder conversion, live queue, day book |
 | `/admin/calendar`  | Day view bucketed into morning/afternoon/evening (Asia/Kolkata)              |
 | `/admin/bookings`  | Day book with status transitions and POS collection (UPI / cash)             |
+| `/admin/crm`       | Customer list with segment filters, visit history and loyalty ledger          |
+| `/admin/reviews`   | Review inbox, low-score alerts and public owner replies                      |
+| `/admin/reminders` | Retention funnel plus a consent-aware "queue reminder now" action            |
+| `/admin/invoices`  | Collected bills with tax, commission and partner settlement totals           |
 | `/admin/services`  | Add services, publish/hide, pricing in paise rendered as ₹                    |
 | `/admin/staff`     | Add artists, view working days, apply a Mon–Sat schedule                     |
+| `/admin/resources` | Rooms, chairs and stations that bookable services depend on                  |
 
 `/admin/*` is guarded by `components/partner-gate.tsx`; a customer session sees a
 "switch account" prompt instead of the console.
@@ -61,7 +66,8 @@ code and the modal fills it in for you.
 - `lib/api.ts` — typed fetch client, `ApiError`, `rupees()` paise formatter, and all
   React Query hooks (`useSalonSearch`, `useAvailability`, `useHold`, `useCreateBooking`,
   `usePartnerDashboard`, …). Attaches the bearer token and a generated `Idempotency-Key`
-  for booking creation and invoicing.
+  for booking creation and invoicing. A 401 triggers one single-flight refresh through the
+  HttpOnly `gc_refresh` cookie and then retries the original request.
 - `lib/store.ts` — Zustand stores: persisted auth session (`gc_session`), persisted booking
   draft (`gc_booking`), and auth-modal state. Hydration is tracked so guards don't flash.
 - `components/auth-modal.tsx` — OTP request/verify with the dev OTP surfaced inline.

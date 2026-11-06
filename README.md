@@ -42,7 +42,7 @@ Verify the backend:
 
 ```powershell
 cd salon-api
-npm run smoke          # 20 end-to-end checks
+npm run smoke          # 22 end-to-end checks
 ```
 
 ## Demo accounts
@@ -68,10 +68,14 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 
 ## Status
 
-Implemented and verified: OTP auth, discovery search, availability, 5-minute slot holds,
-booking lifecycle, POS invoicing with GST and commission split, salon CRM, retention
-reminder scheduling, walk-in queue, reviews, admin KYC/commission management. The web app
-and the Expo app both run against the live API.
+Implemented and verified: OTP auth with single-flight token refresh on web and Expo,
+discovery search, availability, 5-minute slot holds, booking lifecycle, POS invoicing with
+GST and commission split, salon CRM, retention reminder scheduling, walk-in queue, customer
+reviews with trigger-maintained rating aggregates, owner review replies, and admin
+KYC/commission management. The web app and the Expo app both run against the live API.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs typechecks and the production web build,
+then migrates, seeds and smoke-tests a PostGIS + Redis stack on every push.
 
 Not implemented (external integrations by design): OpenSearch, BullMQ/n8n workers, actual
 WhatsApp/SMS delivery, S3 uploads and the payment gateway.
