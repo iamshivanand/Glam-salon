@@ -110,7 +110,8 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
   app.get('/bookings', { preHandler: [authenticate] }, async (req) => {
     const q = req.query as Record<string, string>;
     const rows = await query(
-      `SELECT b.*, s.name AS salon_name, s.locality, s.city
+      `SELECT b.*, s.name AS salon_name, s.locality, s.city,
+              (SELECT r.id FROM reviews r WHERE r.booking_id = b.id) AS review_id
          FROM bookings b
          JOIN salons s ON s.id = b.salon_id
         WHERE b.customer_id = $1

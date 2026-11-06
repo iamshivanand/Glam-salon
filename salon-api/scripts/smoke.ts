@@ -43,7 +43,7 @@ async function login(phone: string) {
     body: { phone },
   });
   if (!challenge.dev_otp) throw new Error('dev_otp missing (DEV_RETURN_OTP=false?)');
-  const tokens = await call<{ access_token: string; user: any }>('/auth/otp/verify', {
+  const tokens = await call<{ access_token: string; refresh_token: string; user: any }>('/auth/otp/verify', {
     method: 'POST',
     body: { challenge_id: challenge.challenge_id, otp: challenge.dev_otp },
   });
@@ -58,7 +58,7 @@ async function main() {
   console.log(`\nGlam Connect API smoke test → ${BASE}\n`);
 
   // Health
-  const health = await fetch(`${BASE}/health`).then((r) => r.json());
+  const health = (await fetch(`${BASE}/health`).then((r) => r.json())) as any;
   health.status === 'ok' ? ok('health', health.checks) : fail('health', health);
 
   // Auth
@@ -131,22 +131,48 @@ async function main() {
   const queue = await call<any>('/partner/queue', { token: owner.access_token });
   ok('live walk-in queue', `${queue.waiting_count} waiting · now serving ${queue.now_serving_token ?? '—'}`);
 
-  const confirmed = todayBookings.bookings.find((b: any) => b.status === 'CONFIRMED');
-  if (confirmed) {
-    const invoice = await call<any>('/partner/invoices', {
-      method: 'POST',
-      token: owner.access_token,
-      key: `smoke-invoice-${Date.now()}`,
-      body: { booking_id: confirmed.id, method: 'UPI_QR' },
-    });
-    ok('POS invoice', `${invoice.invoice_number} · net ₹${(invoice.net_collected_paise / 100).toFixed(0)}`);
-  } else {
-    console.log('  SKIP  POS invoice — no CONFIRMED booking today');
-  }
+  // POS is self-contained: check in the booking this smoke run just created,
+  // then bill it. It no longer depends on seed data being dated "today".
+  await call(`/bookings/${booking.id}/status`, {
+    method: 'PATCH',
+    token: owner.access_token,
+    body: { status: 'ARRIVED' },
+  });
+  const invoice = await call<any>('/partner/invoices', {
+    method: 'POST',
+    token: owner.access_token,
+    key: `smoke-invoice-${Date.now()}`,
+    body: { booking_id: booking.id, method: 'UPI_QR' },
+  });
+  ok('POS invoice', `${invoice.invoice_number} · net ₹${(invoice.net_collected_paise / 100).toFixed(0)}`);
+
+  // A completed visit must be reviewable, and the salon aggregate must move.
+  const past = await call<any>('/bookings', { token: customer.access_token });
+  const completed = past.bookings.find((b: any) => b.id === booking.id && b.status === 'COMPLETED');
+  if (!completed) throw new Error('invoice did not complete the booking');
+  const review = await call<any>(`/bookings/${booking.id}/reviews`, {
+    method: 'POST',
+    token: customer.access_token,
+    body: { overall_rating: 5, hygiene_rating: 5, review_text: 'Smoke test review' },
+  });
+  const ratedProfile = await call<any>(`/salons/${salonId}`);
+  ok(
+    'review + aggregate sync',
+    `review ${review.id.slice(0, 8)} · salon now ★${ratedProfile.avg_rating} (${ratedProfile.review_count})`,
+  );
 
   // Customer bookings list
   const mine = await call<any>('/bookings', { token: customer.access_token });
   ok('customer bookings list', `${mine.bookings.length} bookings`);
+
+  // Refresh-token rotation
+  const rotated = await call<any>('/auth/refresh', {
+    method: 'POST',
+    body: { refresh_token: customer.refresh_token },
+  });
+  if (!rotated.access_token || !rotated.refresh_token) throw new Error('refresh did not return new tokens');
+  const meAfterRefresh = await call('/auth/me', { token: rotated.access_token });
+  ok('refresh token rotation', meAfterRefresh.phone_masked);
 
   // Admin
   const admin = await login('+919800000009');

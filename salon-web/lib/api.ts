@@ -17,6 +17,20 @@ export class ApiError extends Error {
   }
 }
 
+let tokenChangeHandler: ((token: string | null) => void) | null = null;
+let sessionExpiredHandler: (() => void) | null = null;
+let refreshInFlight: Promise<string | null> | null = null;
+
+/** Registered by the auth store so refreshed/cleared tokens stay in sync with React state. */
+export function onTokenChange(handler: (token: string | null) => void) {
+  tokenChangeHandler = handler;
+}
+
+/** Registered by the auth store so a dead refresh session clears the signed-in user. */
+export function onSessionExpired(handler: () => void) {
+  sessionExpiredHandler = handler;
+}
+
 export function getToken(): string | null {
   if (typeof window === 'undefined') return null;
   return window.localStorage.getItem(TOKEN_KEY);
@@ -26,24 +40,93 @@ export function setToken(token: string | null) {
   if (typeof window === 'undefined') return;
   if (token) window.localStorage.setItem(TOKEN_KEY, token);
   else window.localStorage.removeItem(TOKEN_KEY);
+  tokenChangeHandler?.(token);
+}
+
+/**
+ * Exchange the HttpOnly refresh cookie for a fresh access token.
+ * Concurrent 401s share one in-flight request so we never rotate the same
+ * refresh token twice.
+ */
+export async function refreshSession(): Promise<string | null> {
+  if (typeof window === 'undefined') return null;
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      try {
+        const res = await fetch(`${API_URL}/auth/refresh`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        if (!res.ok) return null;
+        const json = (await res.json()) as { access_token?: string };
+        if (!json?.access_token) return null;
+        setToken(json.access_token);
+        return json.access_token;
+      } catch {
+        return null;
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+  }
+  return refreshInFlight;
+}
+
+/** Revoke the refresh token server-side, then clear local state. */
+export async function logoutSession(): Promise<void> {
+  try {
+    await fetch(`${API_URL}/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+  } catch {
+    // Offline logout still clears the local session.
+  } finally {
+    setToken(null);
+  }
 }
 
 export async function api<T>(path: string, opts: { method?: string; body?: unknown; key?: string } = {}): Promise<T> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const token = getToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
-  if (opts.key) headers['Idempotency-Key'] = opts.key;
+  const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body);
 
-  const res = await fetch(`${API_URL}${path}`, {
-    method: opts.method ?? 'GET',
-    headers,
-    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-  });
+  const request = (token: string | null) => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (opts.key) headers['Idempotency-Key'] = opts.key;
+    return fetch(`${API_URL}${path}`, {
+      method: opts.method ?? 'GET',
+      headers,
+      body: payload,
+      credentials: 'include',
+    });
+  };
+
+  let token = getToken();
+  let res = await request(token);
+
+  // Access tokens live 15 minutes. Try the refresh cookie once before giving up.
+  if (res.status === 401 && token && !path.startsWith('/auth/')) {
+    const fresh = await refreshSession();
+    if (fresh) {
+      token = fresh;
+      res = await request(fresh);
+    } else {
+      setToken(null);
+      sessionExpiredHandler?.();
+    }
+  }
 
   const text = await res.text();
   const json = text ? JSON.parse(text) : null;
   if (!res.ok) {
-    if (res.status === 401 && token) setToken(null);
+    if (res.status === 401 && token && !path.startsWith('/auth/')) {
+      setToken(null);
+      sessionExpiredHandler?.();
+    }
     throw new ApiError(res.status, json?.error?.code ?? 'ERROR', json?.error?.message ?? `Request failed (${res.status})`, json?.error?.details);
   }
   return json as T;
@@ -78,6 +161,9 @@ export const qk = {
   partnerReminders: ['partner', 'reminders'] as const,
   partnerQueue: ['partner', 'queue'] as const,
   partnerInvoices: ['partner', 'invoices'] as const,
+  partnerReviews: ['partner', 'reviews'] as const,
+  partnerResources: ['partner', 'resources'] as const,
+  partnerCrmDetail: (customerId: string) => ['partner', 'crm', customerId] as const,
 };
 
 export interface SalonCard {
@@ -180,6 +266,7 @@ export interface MyBooking {
   locality: string;
   city: string;
   checkin_pin?: string;
+  review_id?: string | null;
 }
 
 export interface PartnerBooking {
@@ -324,11 +411,141 @@ export function usePartnerStaff(enabled = true) {
   });
 }
 
+export interface CrmCustomer {
+  id: string;
+  salon_id: string;
+  customer_id: string;
+  customer_name: string;
+  custom_customer_code: string;
+  preferred_staff_id: string | null;
+  total_visits: number;
+  total_spend_paise: number;
+  avg_bill_paise: number;
+  computed_visit_interval_days: number;
+  retention_segment: 'NEW' | 'REGULAR' | 'AT_RISK' | 'INACTIVE';
+  last_visit_at: string;
+  next_expected_visit_date: string | null;
+  loyalty_points_balance: number;
+}
+
 export function usePartnerCrm(enabled = true) {
   return useQuery({
     queryKey: qk.partnerCrm,
-    queryFn: () => api<{ customers: any[] }>('/partner/crm'),
+    queryFn: () => api<{ customers: CrmCustomer[] }>('/partner/crm'),
     enabled,
+  });
+}
+
+export function usePartnerCrmDetail(customerId?: string) {
+  return useQuery({
+    queryKey: qk.partnerCrmDetail(customerId ?? ''),
+    queryFn: () =>
+      api<{
+        crm: CrmCustomer;
+        visits: { id: string; booking_code: string; status: string; scheduled_start_at: string; total_payable_paise: number }[];
+        ledger: {
+          id: string;
+          entry_type: string;
+          bucket: string;
+          amount_delta: number;
+          balance_after: number;
+          created_at: string;
+        }[];
+      }>(`/partner/crm/${customerId}`),
+    enabled: !!customerId,
+  });
+}
+
+export function useUpdateCrm() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ customerId, ...body }: { customerId: string; retention_segment?: CrmCustomer['retention_segment']; custom_customer_code?: string }) =>
+      api(`/partner/crm/${customerId}`, { method: 'PATCH', body }),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.partnerCrm });
+      qc.invalidateQueries({ queryKey: qk.partnerCrmDetail(vars.customerId) });
+    },
+  });
+}
+
+export function usePartnerReviews(enabled = true) {
+  return useQuery({
+    queryKey: qk.partnerReviews,
+    queryFn: () =>
+      api<{
+        open_alerts: number;
+        reviews: {
+          id: string;
+          booking_id: string;
+          overall_rating: number;
+          hygiene_rating: number;
+          review_text: string | null;
+          owner_reply: string | null;
+          resolution_status: string;
+          created_at: string;
+          customer_name: string;
+          staff_name: string | null;
+        }[];
+      }>('/partner/reviews'),
+    enabled,
+  });
+}
+
+export function useReplyReview() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, owner_reply, resolution_status }: { id: string; owner_reply: string; resolution_status?: string }) =>
+      api(`/partner/reviews/${id}/reply`, { method: 'POST', body: { owner_reply, resolution_status } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerReviews }),
+  });
+}
+
+export function usePartnerResources(enabled = true) {
+  return useQuery({
+    queryKey: qk.partnerResources,
+    queryFn: () =>
+      api<{ resources: { id: string; name: string; resource_type: string }[] }>('/partner/resources'),
+    enabled,
+  });
+}
+
+export function useCreateResource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { name: string; resource_type: string }) =>
+      api('/partner/resources', { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerResources }),
+  });
+}
+
+export function useTriggerReminders() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      customer_ids: string[];
+      channel: 'WHATSAPP' | 'SMS' | 'PUSH' | 'EMAIL';
+      template_code: string;
+    }) => api<{ enqueued: number; skipped: number }>('/partner/reminders/trigger', { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerReminders }),
+  });
+}
+
+export function useSubmitReview() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      bookingId,
+      ...body
+    }: {
+      bookingId: string;
+      overall_rating: number;
+      hygiene_rating: number;
+      review_text?: string;
+    }) => api(`/bookings/${bookingId}/reviews`, { method: 'POST', body }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.myBookings });
+      qc.invalidateQueries({ queryKey: ['salon'] });
+    },
   });
 }
 

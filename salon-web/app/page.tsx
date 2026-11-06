@@ -43,7 +43,12 @@ export default function Home() {
       <section className="card overflow-hidden grid md:grid-cols-2">
         <div className="p-8 md:p-12">
           <p className="text-accent font-semibold text-sm tracking-widest">
-            ★ {primary ? primary.avg_rating.toFixed(1) : '4.8'} · {primary ? primary.review_count : '—'} reviews · {primary?.locality ?? 'Bengaluru'}
+            {primary
+              ? primary.review_count
+                ? `★ ${primary.avg_rating.toFixed(1)} · ${primary.review_count} reviews`
+                : '★ New salon'
+              : '★ —'}{' '}
+            · {primary?.locality ?? 'Bengaluru'}
           </p>
           <h1 className="font-display text-5xl md:text-6xl leading-tight mt-3">
             Beauty rituals,
@@ -89,7 +94,9 @@ export default function Home() {
                     <p className="font-semibold text-lg leading-tight">{s.name}</p>
                     <p className="text-xs opacity-60">{s.locality} · {s.distance_km != null ? `${s.distance_km} km` : s.city}</p>
                   </div>
-                  <span className="text-sm whitespace-nowrap">★ {s.avg_rating.toFixed(1)}</span>
+                  <span className="text-sm whitespace-nowrap">
+                    {s.review_count ? `★ ${s.avg_rating.toFixed(1)} (${s.review_count})` : 'New'}
+                  </span>
                 </div>
                 <p className="text-sm opacity-70 mt-2 line-clamp-2">{s.description}</p>
                 <div className="flex flex-wrap gap-1.5 mt-3">

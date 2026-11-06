@@ -2,7 +2,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { api, setToken } from './api';
+import { api, logoutSession, onSessionExpired, onTokenChange, setToken } from './api';
 
 export interface SessionUser {
   id: string;
@@ -19,7 +19,7 @@ interface AuthState {
   hydrated: boolean;
   requestOtp: (phone: string) => Promise<{ challenge_id: string; dev_otp?: string; expires_in: number }>;
   verifyOtp: (challengeId: string, otp: string, fullName?: string) => Promise<SessionUser>;
-  logout: () => void;
+  logout: () => Promise<void>;
   setHydrated: () => void;
 }
 
@@ -43,8 +43,8 @@ export const useAuth = create<AuthState>()(
         set({ token: res.access_token, user: res.user });
         return res.user;
       },
-      logout: () => {
-        setToken(null);
+      logout: async () => {
+        await logoutSession();
         set({ token: null, user: null });
       },
       setHydrated: () => set({ hydrated: true }),
@@ -118,3 +118,7 @@ export const useAuthModal = create<AuthModalState>((set) => ({
   openModal: (reason) => set({ open: true, reason }),
   closeModal: () => set({ open: false }),
 }));
+
+// Keep the persisted session in sync when api.ts refreshes or drops the token.
+onTokenChange((token) => useAuth.setState({ token }));
+onSessionExpired(() => useAuth.setState({ token: null, user: null }));

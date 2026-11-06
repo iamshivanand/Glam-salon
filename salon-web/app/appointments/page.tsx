@@ -1,7 +1,8 @@
 'use client';
 
+import { useState } from 'react';
 import Link from 'next/link';
-import { useCancelBooking, useMyBookings, rupees } from '@/lib/api';
+import { useCancelBooking, useMyBookings, useSubmitReview, rupees } from '@/lib/api';
 import { useAuth, useAuthModal } from '@/lib/store';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -16,6 +17,73 @@ const STATUS_LABEL: Record<string, string> = {
   NO_SHOW: 'No show',
   EXPIRED: 'Expired',
 };
+
+function ReviewForm({ bookingId }: { bookingId: string }) {
+  const [open, setOpen] = useState(false);
+  const [overall, setOverall] = useState(5);
+  const [hygiene, setHygiene] = useState(5);
+  const [text, setText] = useState('');
+  const [problem, setProblem] = useState<string | null>(null);
+  const submit = useSubmitReview();
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)} className="btn-primary !py-2 !px-4 text-sm">
+        Leave a review
+      </button>
+    );
+  }
+
+  return (
+    <div className="w-full border-t border-line pt-3 mt-1 space-y-2">
+      <div className="flex flex-wrap gap-4 text-sm">
+        <label className="flex items-center gap-2">
+          Visit
+          <select value={overall} onChange={(e) => setOverall(Number(e.target.value))} className="border border-line rounded-lg px-2 py-1 bg-transparent">
+            {[5, 4, 3, 2, 1].map((n) => <option key={n} value={n}>{n} ★</option>)}
+          </select>
+        </label>
+        <label className="flex items-center gap-2">
+          Hygiene
+          <select value={hygiene} onChange={(e) => setHygiene(Number(e.target.value))} className="border border-line rounded-lg px-2 py-1 bg-transparent">
+            {[5, 4, 3, 2, 1].map((n) => <option key={n} value={n}>{n} ★</option>)}
+          </select>
+        </label>
+      </div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        maxLength={2000}
+        placeholder="What went well? What could be better?"
+        className="w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm"
+      />
+      {problem && <p className="text-xs text-red-600">{problem}</p>}
+      <div className="flex gap-2">
+        <button
+          onClick={async () => {
+            setProblem(null);
+            try {
+              await submit.mutateAsync({
+                bookingId,
+                overall_rating: overall,
+                hygiene_rating: hygiene,
+                review_text: text.trim() || undefined,
+              });
+            } catch (err: any) {
+              setProblem(err.message);
+            }
+          }}
+          disabled={submit.isPending}
+          className="btn-primary !py-2 !px-4 text-sm"
+        >
+          {submit.isPending ? 'Submitting…' : 'Submit review'}
+        </button>
+        <button onClick={() => setOpen(false)} className="text-xs underline opacity-60">Cancel</button>
+      </div>
+    </div>
+  );
+}
 
 export default function AppointmentsPage() {
   const { user, hydrated } = useAuth();
@@ -72,7 +140,12 @@ export default function AppointmentsPage() {
                   Cancel booking
                 </button>
               )}
-              {b.status === 'COMPLETED' && <span className="text-xs opacity-60">Visit verified · review from the app</span>}
+              {b.status === 'COMPLETED' &&
+                (b.review_id ? (
+                  <span className="text-xs opacity-60">★ Review submitted</span>
+                ) : (
+                  <ReviewForm bookingId={b.id} />
+                ))}
             </div>
           </div>
         );

@@ -1112,8 +1112,12 @@ const TABS: [Tab, string][] = [
 
 function Shell() {
   const { tab, setTab } = useUi();
-  const { user, logout } = useAuth();
+  const { user, logout, hydrate } = useAuth();
   const owner = isOwner(user);
+
+  useEffect(() => {
+    void hydrate();
+  }, [hydrate]);
 
   return (
     <VStack flex={1} bg="cream.50" safeArea>

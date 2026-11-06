@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  static:
+    name: Typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            salon-api/package-lock.json
+            salon-web/package-lock.json
+            salon-mobile/package-lock.json
+
+      - name: Install API
+        working-directory: salon-api
+        run: npm ci
+
+      - name: API typecheck
+        working-directory: salon-api
+        run: npm run typecheck
+
+      - name: API build
+        working-directory: salon-api
+        run: npm run build
+
+      - name: Install web
+        working-directory: salon-web
+        run: npm ci
+
+      - name: Web build
+        working-directory: salon-web
+        run: npm run build
+
+      - name: Install mobile
+        working-directory: salon-mobile
+        run: npm ci
+
+      - name: Mobile typecheck
+        working-directory: salon-mobile
+        run: npm run typecheck
+
+  smoke:
+    name: Database smoke test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: glam
+          POSTGRES_PASSWORD: glam_dev_pw
+          POSTGRES_DB: glamconnect
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U glam -d glamconnect"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://glam_app:glam_app_pw@127.0.0.1:5432/glamconnect
+      MIGRATE_DATABASE_URL: postgres://glam:glam_dev_pw@127.0.0.1:5432/glamconnect
+      REDIS_URL: redis://127.0.0.1:6379
+      JWT_SECRET: ci_jwt_secret_change_me_0123456789
+      PHONE_ENC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      PHONE_PEPPER: ci_phone_pepper
+      DEV_RETURN_OTP: 'true'
+      CORS_ORIGIN: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: salon-api/package-lock.json
+
+      - name: Install
+        working-directory: salon-api
+        run: npm ci
+
+      - name: Migrate
+        working-directory: salon-api
+        run: npm run migrate
+
+      - name: Seed
+        working-directory: salon-api
+        run: npm run seed
+
+      - name: Start API
+        working-directory: salon-api
+        run: |
+          npm run dev > /tmp/salon-api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4000/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/salon-api.log
+          exit 1
+
+      - name: Smoke test
+        working-directory: salon-api
+        run: npm run smoke
+
+      - name: API logs on failure
+        if: failure()
+        run: cat /tmp/salon-api.log

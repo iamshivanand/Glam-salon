@@ -1,46 +1,118 @@
 import { create } from 'zustand';
+import { Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 import {
   api,
+  logoutRequest,
+  onTokenRefreshed,
   setAccessToken,
+  setRefreshToken,
+  setSessionExpiredHandler,
   todayIST,
   type SessionUser,
 } from './api';
 
 // ------------------------------------------------------------------ auth
+const SESSION_KEY = 'gc_session_v1';
+
+interface PersistedSession {
+  access_token: string;
+  refresh_token: string;
+  user: SessionUser;
+}
+
+async function readSession(): Promise<PersistedSession | null> {
+  try {
+    const raw =
+      Platform.OS === 'web'
+        ? typeof localStorage !== 'undefined'
+          ? localStorage.getItem(SESSION_KEY)
+          : null
+        : await SecureStore.getItemAsync(SESSION_KEY);
+    return raw ? (JSON.parse(raw) as PersistedSession) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeSession(value: PersistedSession | null): Promise<void> {
+  try {
+    if (Platform.OS === 'web') {
+      if (typeof localStorage === 'undefined') return;
+      if (value) localStorage.setItem(SESSION_KEY, JSON.stringify(value));
+      else localStorage.removeItem(SESSION_KEY);
+      return;
+    }
+    if (value) await SecureStore.setItemAsync(SESSION_KEY, JSON.stringify(value));
+    else await SecureStore.deleteItemAsync(SESSION_KEY);
+  } catch {
+    // Storage failures must never block sign-in; the session stays in memory.
+  }
+}
+
 interface AuthState {
   token: string | null;
   user: SessionUser | null;
+  hydrated: boolean;
+  hydrate: () => Promise<void>;
   requestOtp: (phone: string) => Promise<{ challenge_id: string; expires_in: number; dev_otp?: string }>;
   verifyOtp: (challengeId: string, otp: string, fullName?: string) => Promise<SessionUser>;
-  logout: () => void;
+  logout: () => Promise<void>;
 }
 
-/**
- * Sessions are held in memory only: closing the app signs you out. Persisting the
- * token would need expo-secure-store, which this prototype does not install.
- */
 export const useAuth = create<AuthState>((set) => ({
   token: null,
   user: null,
+  hydrated: false,
+  hydrate: async () => {
+    const stored = await readSession();
+    if (stored) {
+      setAccessToken(stored.access_token);
+      setRefreshToken(stored.refresh_token);
+      set({ token: stored.access_token, user: stored.user, hydrated: true });
+    } else {
+      set({ hydrated: true });
+    }
+  },
   requestOtp: (phone) =>
     api<{ challenge_id: string; expires_in: number; dev_otp?: string }>('/auth/otp/request', {
       method: 'POST',
       body: { phone },
     }),
   verifyOtp: async (challengeId, otp, fullName) => {
-    const res = await api<{ access_token: string; user: SessionUser }>('/auth/otp/verify', {
-      method: 'POST',
-      body: { challenge_id: challengeId, otp, full_name: fullName },
-    });
+    const res = await api<{ access_token: string; refresh_token: string; user: SessionUser }>(
+      '/auth/otp/verify',
+      {
+        method: 'POST',
+        body: { challenge_id: challengeId, otp, full_name: fullName },
+      },
+    );
     setAccessToken(res.access_token);
+    setRefreshToken(res.refresh_token);
+    await writeSession(res);
     set({ token: res.access_token, user: res.user });
     return res.user;
   },
-  logout: () => {
-    setAccessToken(null);
+  logout: async () => {
+    await logoutRequest();
+    await writeSession(null);
     set({ token: null, user: null });
   },
 }));
+
+// Rotated tokens must be persisted, otherwise a reload would replay a dead
+// refresh token and sign the user out.
+onTokenRefreshed((access_token, refresh_token) => {
+  const user = useAuth.getState().user;
+  if (!user) return;
+  void writeSession({ access_token, refresh_token, user });
+  useAuth.setState({ token: access_token });
+});
+
+setSessionExpiredHandler(() => {
+  void writeSession(null);
+  useAuth.setState({ token: null, user: null });
+});
 
 // ------------------------------------------------------------------ booking draft
 interface BookingState {

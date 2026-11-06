@@ -10,9 +10,69 @@
 export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
 
 let accessToken: string | null = null;
+let refreshToken: string | null = null;
+let refreshInFlight: Promise<string | null> | null = null;
+let sessionExpiredHandler: (() => void) | null = null;
+let tokenRefreshedHandler: ((accessToken: string, refreshToken: string) => void) | null = null;
+
 export const setAccessToken = (token: string | null) => {
   accessToken = token;
 };
+export const setRefreshToken = (token: string | null) => {
+  refreshToken = token;
+};
+export const getRefreshToken = () => refreshToken;
+export const setSessionExpiredHandler = (handler: () => void) => {
+  sessionExpiredHandler = handler;
+};
+export const onTokenRefreshed = (handler: (accessToken: string, refreshToken: string) => void) => {
+  tokenRefreshedHandler = handler;
+};
+
+/** Rotate the refresh token once for any number of concurrent 401 responses. */
+export async function refreshSession(): Promise<string | null> {
+  if (!refreshToken) return null;
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      try {
+        const res = await fetch(`${API_URL}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        if (!res.ok) return null;
+        const json = (await res.json()) as { access_token?: string; refresh_token?: string };
+        if (!json?.access_token) return null;
+        accessToken = json.access_token;
+        if (json.refresh_token) refreshToken = json.refresh_token;
+        if (refreshToken) tokenRefreshedHandler?.(accessToken, refreshToken);
+        return json.access_token;
+      } catch {
+        return null;
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+  }
+  return refreshInFlight;
+}
+
+export async function logoutRequest(): Promise<void> {
+  try {
+    if (refreshToken) {
+      await fetch(`${API_URL}/auth/logout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+    }
+  } catch {
+    // Offline sign-out still clears the local session.
+  } finally {
+    accessToken = null;
+    refreshToken = null;
+  }
+}
 
 export class ApiError extends Error {
   status: number;
@@ -33,24 +93,55 @@ export async function api<T>(
   path: string,
   opts: { method?: string; body?: unknown; key?: string } = {},
 ): Promise<T> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  if (opts.key) headers['Idempotency-Key'] = opts.key;
+  const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body);
 
-  let res: Response;
-  try {
-    res = await fetch(`${API_URL}${path}`, {
+  const request = (token: string | null) => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (opts.key) headers['Idempotency-Key'] = opts.key;
+    return fetch(`${API_URL}${path}`, {
       method: opts.method ?? 'GET',
       headers,
-      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+      body: payload,
     });
+  };
+
+  const networkError = () =>
+    new ApiError(0, 'NETWORK_ERROR', `Cannot reach the API at ${API_URL}. Is salon-api running?`);
+
+  let token = accessToken;
+  let res: Response;
+  try {
+    res = await request(token);
   } catch {
-    throw new ApiError(0, 'NETWORK_ERROR', `Cannot reach the API at ${API_URL}. Is salon-api running?`);
+    throw networkError();
+  }
+
+  // Rotate the 15-minute access token once before surfacing a 401.
+  if (res.status === 401 && token && !path.startsWith('/auth/')) {
+    const fresh = await refreshSession();
+    if (fresh) {
+      token = fresh;
+      try {
+        res = await request(fresh);
+      } catch {
+        throw networkError();
+      }
+    } else {
+      accessToken = null;
+      refreshToken = null;
+      sessionExpiredHandler?.();
+    }
   }
 
   const text = await res.text();
   const json = text ? JSON.parse(text) : null;
   if (!res.ok) {
+    if (res.status === 401 && token && !path.startsWith('/auth/')) {
+      accessToken = null;
+      refreshToken = null;
+      sessionExpiredHandler?.();
+    }
     throw new ApiError(
       res.status,
       json?.error?.code ?? 'ERROR',

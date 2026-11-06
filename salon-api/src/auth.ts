@@ -80,7 +80,9 @@ export async function rotateRefresh(rawToken: string, ip?: string): Promise<Issu
   const user = await one(`SELECT id, role FROM users WHERE id = $1 AND status = 'ACTIVE'`, [row.user_id]);
   if (!user) throw unauthorized('User not found');
 
-  const salon = await one(`SELECT id FROM salons WHERE owner_id = $1 LIMIT 1`, [user.id]);
+  // Must match the login route. Without the ordering, a refreshed token could
+  // point at a different salon than the one the session originally signed into.
+  const salon = await one(`SELECT id FROM salons WHERE owner_id = $1 ORDER BY created_at LIMIT 1`, [user.id]);
   return issueTokens(
     { id: user.id, role: user.role as UserRole, salonId: salon?.id ?? null },
     { familyId: row.token_family_id, deviceFingerprint: row.device_fingerprint ?? undefined, ip },

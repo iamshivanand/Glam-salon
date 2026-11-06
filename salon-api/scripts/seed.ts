@@ -498,6 +498,9 @@ const s1 = serviceIdsBySalon.get(salon1.id)!;
 const s2 = serviceIdsBySalon.get(salon2.id)!;
 const st1 = staffIdsBySalon.get(salon1.id)!;
 const st2 = staffIdsBySalon.get(salon2.id)!;
+const salon3 = salons[2];
+const s3 = serviceIdsBySalon.get(salon3.id)!;
+const st3 = staffIdsBySalon.get(salon3.id)!;
 const customer2 = uid(USERS, 2);
 const customer3 = uid(USERS, 3);
 const customer4 = uid(USERS, 4);
@@ -583,6 +586,57 @@ await insertInvoice({
   method: 'CASH',
 });
 
+// Completed visits at salon 3 so every salon has review rows behind its rating.
+const bookingD = await insertBooking({
+  id: uid(BOOKINGS, 5),
+  code: 'GC-2026-0005',
+  key: 'seed-booking-0005',
+  customerId: customer3,
+  salonId: salon3.id,
+  staffId: st3[0],
+  start: istAt(-8, '11:30'),
+  status: 'COMPLETED',
+  createdAt: istAt(-9, '16:10'),
+  services: [{ id: s3[0], name: serviceTemplates[0].name, price: 120000, duration: 60 }],
+});
+await insertInvoice({
+  id: uid(INVOICES, 4),
+  number: 'INV-GC-2026-0005',
+  key: 'seed-invoice-0005',
+  salonId: salon3.id,
+  customerId: customer3,
+  bookingId: uid(BOOKINGS, 5),
+  gross: bookingD.subtotal,
+  commissionBps: 500,
+  createdAt: istAt(-8, '12:45'),
+  method: 'UPI_QR',
+});
+
+const bookingE = await insertBooking({
+  id: uid(BOOKINGS, 6),
+  code: 'GC-2026-0006',
+  key: 'seed-booking-0006',
+  customerId: customer4,
+  salonId: salon3.id,
+  staffId: st3[1],
+  start: istAt(-15, '15:00'),
+  status: 'COMPLETED',
+  createdAt: istAt(-16, '10:20'),
+  services: [{ id: s3[1], name: serviceTemplates[1].name, price: 450000, duration: 120 }],
+});
+await insertInvoice({
+  id: uid(INVOICES, 5),
+  number: 'INV-GC-2026-0006',
+  key: 'seed-invoice-0006',
+  salonId: salon3.id,
+  customerId: customer4,
+  bookingId: uid(BOOKINGS, 6),
+  gross: bookingE.subtotal,
+  commissionBps: 500,
+  createdAt: istAt(-15, '16:40'),
+  method: 'CASH',
+});
+
 // Today's confirmed visit for the partner calendar
 await insertBooking({
   id: uid(BOOKINGS, 4),
@@ -639,6 +693,35 @@ await q(
     st2[1],
     'Best gel manicure I have had in Koramangala. Booking on Glam Connect took seconds.',
     istAt(-19, '11:30'),
+  ],
+);
+
+await q(
+  `INSERT INTO reviews
+     (id, booking_id, salon_id, customer_id, staff_id, overall_rating, hygiene_rating, review_text, created_at)
+   VALUES ($1,$2,$3,$4,$5,4,5,$6,$7)`,
+  [
+    uid(REVIEWS, 4),
+    uid(BOOKINGS, 5),
+    salon3.id,
+    customer3,
+    st3[0],
+    'Quick, friendly and spotless. The haircut was exactly the shape I asked for.',
+    istAt(-7, '09:40'),
+  ],
+);
+await q(
+  `INSERT INTO reviews
+     (id, booking_id, salon_id, customer_id, staff_id, overall_rating, hygiene_rating, review_text, created_at)
+   VALUES ($1,$2,$3,$4,$5,5,4,$6,$7)`,
+  [
+    uid(REVIEWS, 5),
+    uid(BOOKINGS, 6),
+    salon3.id,
+    customer4,
+    st3[1],
+    'Lovely colour result and a very calm studio. Will book again.',
+    istAt(-14, '12:05'),
   ],
 );
 

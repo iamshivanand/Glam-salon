@@ -12,8 +12,13 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
             ['Overview', '/admin'],
             ['Calendar', '/admin/calendar'],
             ['Bookings', '/admin/bookings'],
+            ['Customers', '/admin/crm'],
+            ['Reviews', '/admin/reviews'],
+            ['Retention', '/admin/reminders'],
+            ['Invoices', '/admin/invoices'],
             ['Staff', '/admin/staff'],
             ['Services', '/admin/services'],
+            ['Resources', '/admin/resources'],
           ].map(([t, h]) => (
             <Link key={h} href={h} className="chip whitespace-nowrap">
               {t}
