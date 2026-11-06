@@ -45,14 +45,14 @@ code and the modal fills it in for you.
 | ------------------ | ---------------------------------------------------------------------------- |
 | `/`                | Live discovery near Indiranagar, salon cards, popular services, artists, reviews |
 | `/services`        | Full catalogue for the selected salon, grouped by category, add to booking    |
-| `/book`            | 3-step flow: services → artist/date/time → confirm (OTP gate + 5-min hold)    |
+| `/book`            | 3-step flow: services → artist/date/time → confirm (OTP gate + 5-min hold); `?salon=<id>` deep links select the salon |
 | `/appointments`    | Customer booking history, statuses, cancel, check-in PIN, post-visit reviews  |
 | `/admin`           | Partner overview: revenue, retention, reminder conversion, live queue, day book |
 | `/admin/calendar`  | Day view bucketed into morning/afternoon/evening (Asia/Kolkata)              |
 | `/admin/bookings`  | Day book with status transitions and POS collection (UPI / cash)             |
 | `/admin/crm`       | Customer list with segment filters, visit history and loyalty ledger          |
 | `/admin/reviews`   | Review inbox, low-score alerts and public owner replies                      |
-| `/admin/reminders` | Retention funnel plus a consent-aware "queue reminder now" action            |
+| `/admin/reminders` | Retention funnel, consent-aware send, manual dispatch and per-row delivery status |
 | `/admin/invoices`  | Collected bills with tax, commission and partner settlement totals           |
 | `/admin/services`  | Add services, publish/hide, pricing in paise rendered as ₹                    |
 | `/admin/staff`     | Add artists, view working days, apply a Mon–Sat schedule                     |
@@ -81,3 +81,6 @@ code and the modal fills it in for you.
 - Dates are displayed with `timeZone: 'Asia/Kolkata'`.
 - The `X-Salon-Id` header is not sent: a single owner account owns all three demo salons and
   the API resolves the first one automatically.
+- Reminder rows show the provider receipt or `last_error`. Unless Twilio/WhatsApp/Resend
+  credentials are configured in `salon-api/.env`, the API uses its console provider; the UI
+  is honest about receipts, not about carrier delivery.

@@ -11,6 +11,8 @@ import { bookingRoutes } from './routes/bookings.js';
 import { queueRoutes } from './routes/queue.js';
 import { partnerRoutes } from './routes/partner.js';
 import { adminRoutes } from './routes/admin.js';
+import { startReminderDispatcher, type DispatchLog } from './services/dispatcher.js';
+import { notifier } from './services/notifications.js';
 
 export async function buildApp() {
   const app = Fastify({
@@ -88,7 +90,12 @@ export async function buildApp() {
       checks.redis = 'down';
     }
     const healthy = checks.database === 'ok' && checks.redis === 'ok';
-    return reply.status(healthy ? 200 : 503).send({ status: healthy ? 'ok' : 'degraded', checks, time: new Date().toISOString() });
+    return reply.status(healthy ? 200 : 503).send({
+      status: healthy ? 'ok' : 'degraded',
+      checks,
+      notifications: notifier.describe(),
+      time: new Date().toISOString(),
+    });
   });
 
   await app.register(authRoutes, { prefix: '/api/v1' });
@@ -110,9 +117,13 @@ async function main() {
     process.exit(1);
   }
 
+  app.log.info({ notifications: notifier.describe() }, 'notification providers');
+  const stopDispatcher = startReminderDispatcher(app.log as unknown as DispatchLog);
+
   const shutdown = async (signal: string) => {
     app.log.info({ signal }, 'shutting down');
     try {
+      stopDispatcher();
       await app.close();
       await closeDb();
       await closeRedis();

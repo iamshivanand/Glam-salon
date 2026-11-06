@@ -3,9 +3,10 @@ import { z } from 'zod';
 import { one, query } from '../db.js';
 import { redis, rateLimit } from '../redis.js';
 import { blindIndex, encrypt, decrypt, maskPhone, otpCode, hashOtp, uuid } from '../crypto.js';
-import { parse, badRequest, unauthorized, notFound, conflict, forbidden } from '../http.js';
+import { AppError, parse, badRequest, unauthorized, notFound, conflict, forbidden } from '../http.js';
 import { authenticate, issueTokens, rotateRefresh, revokeRefresh } from '../auth.js';
 import { env, devReturnOtp } from '../env.js';
+import { sendOtpCode } from '../services/notifications.js';
 
 const PHONE_RE = /^\+[1-9]\d{9,14}$/;
 
@@ -82,11 +83,19 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       300,
     );
 
-    req.log.info({ phone: maskPhone(phone) }, 'otp issued');
+    try {
+      await sendOtpCode(phone, code);
+    } catch (err) {
+      await redis.del(`otp:${challengeId}`);
+      req.log.error({ err, phone: maskPhone(phone) }, 'otp delivery failed');
+      throw new AppError(502, 'OTP_DELIVERY_FAILED', 'Could not send the code right now. Please try again.');
+    }
+
+    req.log.info({ phone: maskPhone(phone), channel: env.OTP_CHANNEL }, 'otp issued');
     return {
       challenge_id: challengeId,
       expires_in: 300,
-      channel: 'SMS',
+      channel: env.OTP_CHANNEL,
       ...(devReturnOtp ? { dev_otp: code } : {}),
     };
   });

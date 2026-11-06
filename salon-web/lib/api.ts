@@ -525,7 +525,23 @@ export function useTriggerReminders() {
       customer_ids: string[];
       channel: 'WHATSAPP' | 'SMS' | 'PUSH' | 'EMAIL';
       template_code: string;
-    }) => api<{ enqueued: number; skipped: number }>('/partner/reminders/trigger', { method: 'POST', body }),
+    }) =>
+      api<{ enqueued: number; skipped: number; sent: number; failed: number }>('/partner/reminders/trigger', {
+        method: 'POST',
+        body,
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerReminders }),
+  });
+}
+
+export function useDispatchReminders() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { reminder_ids?: string[]; limit?: number } = {}) =>
+      api<{ due: number; sent: number; suppressed: number; failed: number; skipped: number }>(
+        '/partner/reminders/dispatch',
+        { method: 'POST', body },
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerReminders }),
   });
 }

@@ -7,6 +7,7 @@ import { encrypt } from '../crypto.js';
 import { dashboard } from '../services/analytics.js';
 import { createInvoice } from '../services/invoices.js';
 import { listReminders, triggerReminders } from '../services/reminders.js';
+import { dispatchReminders } from '../services/dispatcher.js';
 import { liveQueue, updateQueueStatus } from '../services/queue.js';
 import { fmtLocalDate } from '../services/availability.js';
 
@@ -787,6 +788,23 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       channel: body.channel ?? 'WHATSAPP',
       templateCode: body.template_code,
       serviceCategoryId: body.service_category_id,
+    });
+  });
+
+  app.post('/partner/reminders/dispatch', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+    const salonId = await resolveSalonId(req);
+    const body = parse(
+      z.object({
+        reminder_ids: z.array(z.string().uuid()).max(200).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      }),
+      req.body ?? {},
+    );
+    return dispatchReminders({
+      salonId,
+      ids: body.reminder_ids,
+      limit: body.limit ?? 50,
+      log: req.log as any,
     });
   });
 

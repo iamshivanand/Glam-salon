@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { usePartnerCrm, usePartnerReminders, useTriggerReminders } from '@/lib/api';
+import { useDispatchReminders, usePartnerCrm, usePartnerReminders, useTriggerReminders } from '@/lib/api';
 import { useAuth } from '@/lib/store';
 
 const CHANNELS = ['WHATSAPP', 'SMS', 'EMAIL', 'PUSH'] as const;
@@ -11,6 +11,7 @@ export default function AdminReminders() {
   const { data, isLoading } = usePartnerReminders(!!user);
   const { data: crm } = usePartnerCrm(!!user);
   const trigger = useTriggerReminders();
+  const dispatch = useDispatchReminders();
 
   const [selected, setSelected] = useState<string[]>([]);
   const [channel, setChannel] = useState<(typeof CHANNELS)[number]>('WHATSAPP');
@@ -27,8 +28,24 @@ export default function AdminReminders() {
     try {
       if (!selected.length) throw new Error('Select at least one customer');
       const res = await trigger.mutateAsync({ customer_ids: selected, channel, template_code: template });
-      setNotice(`Queued ${res.enqueued} · skipped ${res.skipped} (no consent or opt-out)`);
+      setNotice(
+        `Queued ${res.enqueued} · sent ${res.sent}${res.failed ? ` · failed ${res.failed} (will retry)` : ''}` +
+          `${res.skipped ? ` · skipped ${res.skipped} (no consent or opt-out)` : ''}`,
+      );
       setSelected([]);
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const runDispatch = async () => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      const res = await dispatch.mutateAsync({ limit: 50 });
+      setNotice(
+        `Due ${res.due} · sent ${res.sent} · suppressed ${res.suppressed} · failed ${res.failed} · locked ${res.skipped}`,
+      );
     } catch (err: any) {
       setProblem(err.message);
     }
@@ -38,11 +55,17 @@ export default function AdminReminders() {
 
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="font-display text-4xl">Retention</h1>
-        <p className="text-sm opacity-60 mt-1">
-          Reminder pipeline. Rows are queued in Postgres; external delivery is not connected yet.
-        </p>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="font-display text-4xl">Retention</h1>
+          <p className="text-sm opacity-60 mt-1">
+            Reminder journey with provider delivery and retries. Development falls back to the console
+            provider until SMS/WhatsApp credentials are configured.
+          </p>
+        </div>
+        <button onClick={runDispatch} disabled={dispatch.isPending} className="chip !py-2">
+          {dispatch.isPending ? 'Running…' : 'Run due reminders'}
+        </button>
       </div>
 
       <div className="grid sm:grid-cols-2 xl:grid-cols-4 gap-4">
@@ -98,18 +121,19 @@ export default function AdminReminders() {
             />
           </label>
           <button onClick={send} disabled={trigger.isPending} className="btn-primary !py-2 !px-4 text-sm">
-            {trigger.isPending ? 'Queueing…' : 'Queue reminder'}
+            {trigger.isPending ? 'Sending…' : 'Send reminder'}
           </button>
         </div>
         <p className="text-[11px] opacity-50">
-          Only customers with a granted RETENTION_REMINDER consent for the chosen channel are queued.
+          Only customers with a granted RETENTION_REMINDER consent for the chosen channel are sent.
+          Failed deliveries stay queued and retry with backoff. PUSH needs a webhook or device service.
         </p>
       </div>
 
       {isLoading && <p>Loading reminders…</p>}
 
       <div className="card overflow-x-auto">
-        <table className="w-full text-sm min-w-[760px]">
+        <table className="w-full text-sm min-w-[900px]">
           <thead>
             <tr className="text-left opacity-60">
               <th className="p-3">Customer</th>
@@ -118,6 +142,7 @@ export default function AdminReminders() {
               <th>Template</th>
               <th>Scheduled</th>
               <th>Status</th>
+              <th>Delivery</th>
             </tr>
           </thead>
           <tbody>
@@ -129,6 +154,15 @@ export default function AdminReminders() {
                 <td className="text-xs opacity-70">{r.template_code}</td>
                 <td>{new Date(r.scheduled_for).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}</td>
                 <td><span className="chip !py-0.5 !px-2">{r.status}</span></td>
+                <td className="text-[11px] max-w-[220px] truncate">
+                  {r.last_error ? (
+                    <span className="text-red-700">{r.last_error}</span>
+                  ) : r.provider_message_id ? (
+                    <span className="opacity-70">{r.provider_message_id}</span>
+                  ) : (
+                    '—'
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>

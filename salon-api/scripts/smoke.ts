@@ -60,6 +60,7 @@ async function main() {
   // Health
   const health = (await fetch(`${BASE}/health`).then((r) => r.json())) as any;
   health.status === 'ok' ? ok('health', health.checks) : fail('health', health);
+  health.notifications ? ok('notification providers', health.notifications) : fail('notification providers', health);
 
   // Auth
   const customer = await login('+919800000002');
@@ -127,6 +128,39 @@ async function main() {
 
   const reminders = await call<any>('/partner/reminders', { token: owner.access_token });
   ok('retention reminders', `${reminders.reminders.length} rows · ${reminders.summary.conversion_rate_pct}% conversion`);
+
+  // Reminder delivery: consent is checked, the provider is called, and the row
+  // carries a provider receipt. CI runs with the console provider.
+  const sentReminder = await call<any>('/partner/reminders/trigger', {
+    method: 'POST',
+    token: owner.access_token,
+    body: {
+      customer_ids: [customer.user.id],
+      channel: 'WHATSAPP',
+      template_code: 'DAY_25_INVITE',
+    },
+  });
+  ok('reminder delivery', `queued ${sentReminder.enqueued} · sent ${sentReminder.sent}`);
+  if (sentReminder.sent !== 1) throw new Error('reminder was not delivered through the provider');
+
+  const afterReminders = await call<any>('/partner/reminders', { token: owner.access_token });
+  const delivered = afterReminders.reminders.find(
+    (r: any) => r.customer_id === customer.user.id && r.status === 'SENT' && r.provider_message_id,
+  );
+  ok('reminder provider receipt', delivered?.provider_message_id ?? 'missing');
+  if (!delivered) throw new Error('delivered reminder has no provider_message_id');
+
+  const consentBlocked = await call<any>('/partner/reminders/trigger', {
+    method: 'POST',
+    token: owner.access_token,
+    body: {
+      customer_ids: [customer.user.id],
+      channel: 'EMAIL',
+      template_code: 'DAY_25_INVITE',
+    },
+  });
+  ok('reminder consent guard', `queued ${consentBlocked.enqueued} · skipped ${consentBlocked.skipped}`);
+  if (consentBlocked.enqueued !== 0) throw new Error('reminder sent without EMAIL consent');
 
   const queue = await call<any>('/partner/queue', { token: owner.access_token });
   ok('live walk-in queue', `${queue.waiting_count} waiting · now serving ${queue.now_serving_token ?? '—'}`);

@@ -43,6 +43,9 @@ export default function BookPage() {
 
   useEffect(() => {
     if (b.date < todayIST()) b.set({ date: todayIST() });
+    // Reminder deep links carry ?salon=<id>; select it before the flow starts.
+    const linkedSalon = new URLSearchParams(window.location.search).get('salon');
+    if (linkedSalon) useBooking.getState().setSalon(linkedSalon);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

@@ -42,7 +42,7 @@ Verify the backend:
 
 ```powershell
 cd salon-api
-npm run smoke          # 22 end-to-end checks
+npm run smoke          # 26 end-to-end checks
 ```
 
 ## Demo accounts
@@ -65,19 +65,27 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 - The API connects as the least-privilege `glam_app` role; CRM and reminder tables are
   protected by `FORCE ROW LEVEL SECURITY` and a per-request `app.current_salon_id` GUC.
 - All routes are versioned under `/api/v1` and errors use `{ error: { code, message } }`.
+- Notifications go through one provider layer. `NOTIFICATION_PROVIDER=auto` wires Twilio
+  SMS/WhatsApp, Meta WhatsApp Cloud, Resend email and/or a generic webhook from credentials
+  in `salon-api/.env`. Development and CI fall back to the console provider, which is
+  refused in production unless explicitly allowed.
 
 ## Status
 
 Implemented and verified: OTP auth with single-flight token refresh on web and Expo,
 discovery search, availability, 5-minute slot holds, booking lifecycle, POS invoicing with
-GST and commission split, salon CRM, retention reminder scheduling, walk-in queue, customer
-reviews with trigger-maintained rating aggregates, owner review replies, and admin
-KYC/commission management. The web app and the Expo app both run against the live API.
+GST and commission split, salon CRM, retention reminder scheduling and provider-backed
+dispatch with retries, walk-in queue, customer reviews with trigger-maintained rating
+aggregates, owner review replies, and admin KYC/commission management. The web app and the
+Expo app both run against the live API.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs typechecks and the production web build,
 then migrates, seeds and smoke-tests a PostGIS + Redis stack on every push.
 
-Not implemented (external integrations by design): OpenSearch, BullMQ/n8n workers, actual
-WhatsApp/SMS delivery, S3 uploads and the payment gateway.
+Real vendor delivery (Twilio, Meta, Resend, webhook) is implemented but **not verified** in
+this repository because no credentials are configured; local/CI delivery uses the console
+provider. Still not implemented: OpenSearch, BullMQ/n8n workers, S3 uploads and the payment
+gateway. Reminders run on an in-process interval or `npm run dispatch` rather than a durable
+queue.
 
 See `salon-api/README.md` and `salon-web/README.md` for details.

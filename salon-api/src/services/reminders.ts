@@ -2,6 +2,7 @@ import type pg from 'pg';
 import { one, withTenant } from '../db.js';
 import { randomToken } from '../crypto.js';
 import { notFound } from '../http.js';
+import { dispatchReminders } from './dispatcher.js';
 
 export interface ReminderScheduleInput {
   salonId: string;
@@ -117,9 +118,10 @@ export async function triggerReminders(opts: {
     (await one<{ id: string }>(`SELECT id FROM service_categories ORDER BY display_order LIMIT 1`))?.id;
   if (!category) throw notFound('No service category configured');
 
-  return withTenant(opts.salonId, async (client) => {
+  const queued = await withTenant(opts.salonId, async (client) => {
     let enqueued = 0;
     let skipped = 0;
+    const reminderIds: string[] = [];
     for (const customerId of opts.customerIds) {
       const consent = await client.query<{ is_granted: boolean }>(
         `SELECT is_granted FROM customer_consents
@@ -131,15 +133,35 @@ export async function triggerReminders(opts: {
         skipped += 1;
         continue;
       }
-      await client.query(
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO retention_reminders
            (salon_id, customer_id, service_category_id, stage, channel, scheduled_for,
-            status, template_code, deep_link_token, sent_at)
-         VALUES ($1, $2, $3, 'DAY_25_INVITE', $4, NOW(), 'SENT', $5, $6, NOW())`,
+            status, template_code, deep_link_token)
+         VALUES ($1, $2, $3, 'DAY_25_INVITE', $4, NOW(), 'SCHEDULED', $5, $6)
+         RETURNING id`,
         [opts.salonId, customerId, category, opts.channel, opts.templateCode, randomToken(16)],
       );
+      reminderIds.push(inserted.rows[0].id);
       enqueued += 1;
     }
-    return { enqueued, skipped };
+    return { enqueued, skipped, reminderIds };
   });
+
+  if (!queued.reminderIds.length) {
+    return { enqueued: 0, skipped: queued.skipped, sent: 0, failed: 0 };
+  }
+
+  // "Send now" should actually attempt delivery. The interval dispatcher remains
+  // responsible for scheduled journey reminders and retries.
+  const delivery = await dispatchReminders({
+    ids: queued.reminderIds,
+    salonId: opts.salonId,
+  });
+
+  return {
+    enqueued: queued.enqueued,
+    skipped: queued.skipped,
+    sent: delivery.sent,
+    failed: delivery.failed,
+  };
 }
