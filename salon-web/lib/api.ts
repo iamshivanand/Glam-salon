@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
 const TOKEN_KEY = 'gc_token';
+const SALON_KEY = 'gc_active_salon';
 
 export class ApiError extends Error {
   constructor(
@@ -41,6 +42,19 @@ export function setToken(token: string | null) {
   if (token) window.localStorage.setItem(TOKEN_KEY, token);
   else window.localStorage.removeItem(TOKEN_KEY);
   tokenChangeHandler?.(token);
+}
+
+/** Multi-salon owners pick the active salon here; every partner call sends X-Salon-Id. */
+export function getActiveSalonId(): string | null {
+  if (typeof window === 'undefined') return null;
+  return window.localStorage.getItem(SALON_KEY);
+}
+
+export function setActiveSalonId(salonId: string | null) {
+  if (typeof window === 'undefined') return;
+  if (salonId) window.localStorage.setItem(SALON_KEY, salonId);
+  else window.localStorage.removeItem(SALON_KEY);
+  window.dispatchEvent(new CustomEvent('gc:salon-changed', { detail: salonId }));
 }
 
 /**
@@ -97,6 +111,8 @@ export async function api<T>(path: string, opts: { method?: string; body?: unkno
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
     if (opts.key) headers['Idempotency-Key'] = opts.key;
+    const salonId = getActiveSalonId();
+    if (salonId) headers['X-Salon-Id'] = salonId;
     return fetch(`${API_URL}${path}`, {
       method: opts.method ?? 'GET',
       headers,
@@ -346,7 +362,7 @@ export function useHold() {
 export function useCreateBooking() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: { hold_token: string; customer_notes?: string }) =>
+    mutationFn: (body: { hold_token: string; customer_notes?: string; reminder_token?: string }) =>
       api<{ id: string; booking_code: string; status: string; checkin_pin: string; scheduled_start_at: string; total_payable_paise: number }>(
         '/bookings',
         { method: 'POST', body, key: crypto.randomUUID() },
@@ -664,5 +680,408 @@ export function useSetSchedule() {
     mutationFn: ({ staffId, entries }: { staffId: string; entries: unknown[] }) =>
       api(`/partner/staff/${staffId}/schedule`, { method: 'POST', body: { entries } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerStaff }),
+  });
+}
+
+// ------------------------------------------------------------------ multi-salon
+export interface PartnerSalonSummary {
+  id: string;
+  name: string;
+  slug: string;
+  city: string;
+  locality: string;
+  verification_status: string;
+  is_active: boolean;
+  avg_rating: number;
+  review_count: number;
+  upcoming_bookings: number;
+}
+
+export function usePartnerSalons(enabled = true) {
+  return useQuery({
+    queryKey: ['partner', 'salons'],
+    queryFn: () => api<{ salons: PartnerSalonSummary[]; active_salon_id: string }>('/partner/salons'),
+    enabled,
+  });
+}
+
+// ------------------------------------------------------------------ engagement
+export interface ReminderFunnel {
+  scheduled: number;
+  sent: number;
+  delivered: number;
+  opened: number;
+  clicked: number;
+  converted: number;
+  suppressed: number;
+  failed: number;
+}
+
+export function useReminderFunnel(enabled = true) {
+  return useQuery({
+    queryKey: ['partner', 'reminders', 'analytics'],
+    queryFn: () => api<{ funnel: ReminderFunnel }>('/partner/reminders/analytics'),
+    enabled,
+  });
+}
+
+// ------------------------------------------------------------------ payments
+export function usePaymentCapabilities() {
+  return useQuery({
+    queryKey: ['payments', 'capabilities'],
+    queryFn: () =>
+      api<{ provider: string; online: boolean; manual: boolean; configured: boolean }>('/payments/capabilities'),
+    staleTime: 5 * 60_000,
+  });
+}
+
+export interface PaymentIntent {
+  payment_id: string;
+  provider: string;
+  status: string;
+  amount_paise: number;
+  currency: string;
+  booking_id: string | null;
+  invoice_id: string | null;
+  instructions?: string;
+  key_id?: string;
+  order_id?: string;
+  checkout?: { provider: string; key: string; order_id: string; amount: number; currency: string };
+}
+
+export function useCreatePaymentIntent() {
+  return useMutation({
+    mutationFn: (body: { booking_id?: string; invoice_id?: string; amount_paise?: number }) =>
+      api<PaymentIntent>('/payments/intents', { method: 'POST', body, key: crypto.randomUUID() }),
+  });
+}
+
+export function useVerifyPayment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      paymentId,
+      ...body
+    }: {
+      paymentId: string;
+      razorpay_order_id: string;
+      razorpay_payment_id: string;
+      razorpay_signature: string;
+    }) => api(`/payments/${paymentId}/verify`, { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['payments'] }),
+  });
+}
+
+export function usePayments(enabled = true) {
+  return useQuery({
+    queryKey: ['payments', 'mine'],
+    queryFn: () => api<{ payments: any[] }>('/payments'),
+    enabled,
+  });
+}
+
+export function usePartnerPayments(enabled = true) {
+  return useQuery({
+    queryKey: ['partner', 'payments'],
+    queryFn: () => api<{ payments: any[] }>('/partner/payments'),
+    enabled,
+  });
+}
+
+export function useRefundPayment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, amount_paise, reason }: { id: string; amount_paise?: number; reason?: string }) =>
+      api(`/partner/payments/${id}/refund`, { method: 'POST', body: { amount_paise, reason } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['partner'] }),
+  });
+}
+
+export function usePartnerSettlements(from?: string, to?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['partner', 'settlements', from, to],
+    queryFn: () =>
+      api<{
+        days: { settlement_date: string; invoices: number; gross_paise: number; commission_paise: number; partner_paise: number }[];
+        totals: { gross_paise: number; commission_paise: number; partner_paise: number; invoices: number };
+        note: string;
+      }>(`/partner/settlements${qs({ from, to })}`),
+    enabled,
+  });
+}
+
+// ------------------------------------------------------------------ uploads
+export interface PresignResult {
+  upload_url: string;
+  method: 'PUT';
+  key: string;
+  expires_in: number;
+  public_url: string | null;
+  headers: Record<string, string>;
+  content_type: string;
+  purpose: string;
+}
+
+export function usePresignUpload() {
+  return useMutation({
+    mutationFn: (body: { purpose: 'avatar' | 'kyc_document' | 'style_photo'; content_type: string; salon_id?: string }) =>
+      api<PresignResult>('/uploads/presign', { method: 'POST', body }),
+  });
+}
+
+/** Presign, PUT the bytes straight to object storage, then return the stored key. */
+export async function uploadFile(
+  file: File,
+  purpose: 'avatar' | 'kyc_document' | 'style_photo',
+  salonId?: string,
+): Promise<PresignResult> {
+  const contentType = file.type || 'application/octet-stream';
+  const presigned = await api<PresignResult>('/uploads/presign', {
+    method: 'POST',
+    body: { purpose, content_type: contentType, salon_id: salonId },
+  });
+  const res = await fetch(presigned.upload_url, {
+    method: presigned.method,
+    headers: { 'Content-Type': contentType, ...presigned.headers },
+    body: file,
+  });
+  if (!res.ok) throw new ApiError(res.status, 'UPLOAD_FAILED', `Storage rejected the upload (${res.status})`);
+  return presigned;
+}
+
+export function useUploadStatus() {
+  return useQuery({
+    queryKey: ['uploads', 'status'],
+    queryFn: () =>
+      api<{ provider: string; configured: boolean; allowed_content_types: string[]; note: string }>('/uploads/status'),
+    staleTime: 5 * 60_000,
+  });
+}
+
+// ------------------------------------------------------------------ customer account
+export interface MyProfile {
+  id: string;
+  full_name: string;
+  email: string | null;
+  role: string;
+  status: string;
+  gender: string | null;
+  date_of_birth: string | null;
+  avatar_s3_key: string | null;
+  phone: string;
+  phone_masked: string;
+  emergency_contacts_json: any[];
+}
+
+export function useMe(enabled = true) {
+  return useQuery({ queryKey: ['me'], queryFn: () => api<MyProfile>('/auth/me'), enabled });
+}
+
+export function useUpdateMe() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Partial<Pick<MyProfile, 'full_name' | 'email' | 'gender' | 'date_of_birth'>>) =>
+      api('/users/me', { method: 'PATCH', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+}
+
+export interface Consent {
+  id?: string;
+  salon_id: string | null;
+  channel: 'WHATSAPP' | 'SMS' | 'PUSH' | 'EMAIL';
+  purpose: 'BOOKING_TRANSACTIONAL' | 'RETENTION_REMINDER' | 'PROMOTIONAL_OFFERS' | 'STYLE_PHOTO_STORAGE';
+  is_granted: boolean;
+  updated_at?: string;
+}
+
+export function useConsents(enabled = true) {
+  return useQuery({
+    queryKey: ['me', 'consents'],
+    queryFn: () => api<{ consents: Consent[] }>('/users/me/consents'),
+    enabled,
+  });
+}
+
+export function useSetConsent() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { channel: Consent['channel']; purpose: Consent['purpose']; is_granted: boolean; salon_id?: string }) =>
+      api('/users/me/consents', { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'consents'] }),
+  });
+}
+
+export interface Address {
+  id: string;
+  label: string;
+  address_line?: string;
+  locality: string;
+  city: string;
+  postal_code: string;
+  is_default: boolean;
+  lat: number;
+  lng: number;
+}
+
+export function useAddresses(enabled = true) {
+  return useQuery({
+    queryKey: ['me', 'addresses'],
+    queryFn: () => api<{ addresses: Address[] }>('/users/me/addresses'),
+    enabled,
+  });
+}
+
+export function useAddAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      label: string;
+      address_line: string;
+      locality: string;
+      city: string;
+      postal_code: string;
+      lat: number;
+      lng: number;
+      is_default?: boolean;
+    }) => api('/users/me/addresses', { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'addresses'] }),
+  });
+}
+
+export function useDeleteAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api(`/users/me/addresses/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'addresses'] }),
+  });
+}
+
+export function useSetAvatar() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (avatar_s3_key: string | null) =>
+      api('/users/me/avatar', { method: 'PATCH', body: { avatar_s3_key } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+}
+
+// ------------------------------------------------------------------ onboarding / KYC
+export interface PartnerSalon {
+  id: string;
+  name: string;
+  description: string | null;
+  verification_status: string;
+  address_line: string;
+  locality: string;
+  city: string;
+  state: string;
+  postal_code: string;
+  operating_hours: Record<string, { open: string | null; close: string | null }>;
+  hygiene_facilities?: Record<string, boolean> | null;
+  kyc?: {
+    id: string;
+    gstin: string | null;
+    bank_ifsc: string;
+    shop_license_s3_key: string | null;
+    status: string;
+    rejection_reason: string | null;
+  } | null;
+}
+
+export function usePartnerSalon(enabled = true) {
+  return useQuery({
+    queryKey: ['partner', 'salon'],
+    queryFn: () => api<PartnerSalon>('/partner/salon'),
+    enabled,
+  });
+}
+
+export function useCreateSalon() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Record<string, unknown>) => api<PartnerSalon>('/partner/salons', { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['partner'] }),
+  });
+}
+
+export function usePatchSalon() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Record<string, unknown>) => api('/partner/salon', { method: 'PATCH', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['partner', 'salon'] }),
+  });
+}
+
+export function useSubmitSalon() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api('/partner/salon/submit', { method: 'POST', body: {} }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['partner'] }),
+  });
+}
+
+export function useSubmitKyc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { pan_number: string; gstin?: string; bank_account_number: string; bank_ifsc: string; shop_license_s3_key?: string }) =>
+      api('/partner/kyc', { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['partner', 'salon'] }),
+  });
+}
+
+// ------------------------------------------------------------------ platform admin
+export function useAdminStats(enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'stats'],
+    queryFn: () =>
+      api<{
+        salons: { total: number; approved: number; pending: number };
+        users: { total: number; customers: number };
+        gmv: { gmv: string; commission: string };
+      }>('/admin/stats'),
+    enabled,
+  });
+}
+
+export function useAdminKyc(status?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'kyc', status ?? 'all'],
+    queryFn: () => api<{ submissions: any[] }>(`/admin/kyc${qs({ status })}`),
+    enabled,
+  });
+}
+
+export function useReviewKyc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ salonId, decision, rejection_reason }: { salonId: string; decision: 'APPROVED' | 'REJECTED' | 'UNDER_REVIEW'; rejection_reason?: string }) =>
+      api(`/admin/kyc/${salonId}/review`, { method: 'POST', body: { decision, rejection_reason } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin'] }),
+  });
+}
+
+export function useAdminSalons(enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'salons'],
+    queryFn: () => api<{ salons: any[] }>('/admin/salons'),
+    enabled,
+  });
+}
+
+export function useAdminUsers(enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'users'],
+    queryFn: () => api<{ users: any[] }>('/admin/users'),
+    enabled,
+  });
+}
+
+export function useUpdateCommission() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ salonId, ...body }: { salonId: string } & Record<string, unknown>) =>
+      api(`/admin/salons/${salonId}/commission`, { method: 'PATCH', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin'] }),
   });
 }

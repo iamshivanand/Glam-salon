@@ -25,6 +25,7 @@ const CreateInput = z.object({
   payment_mode: z.enum(['PAY_AT_SALON', 'PAY_ONLINE', 'WALLET']).optional(),
   customer_notes: z.string().max(1000).optional(),
   channel: z.enum(['CUSTOMER_APP', 'PARTNER_POS', 'WALKIN_CONVERTED', 'URGENT_SLOT']).optional(),
+  reminder_token: z.string().min(8).max(128).optional(),
 });
 
 const RescheduleInput = z.object({
@@ -103,6 +104,7 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
       paymentMode: body.payment_mode,
       customerNotes: body.customer_notes,
       channel: body.channel,
+      reminderToken: body.reminder_token,
       idempotencyKey: idempotencyKey(req),
     });
   });

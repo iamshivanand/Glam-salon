@@ -1,0 +1,1 @@
+# Keeps the directory present so the Docker runtime stage can copy it.

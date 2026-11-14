@@ -46,7 +46,7 @@ The sheet also has one-tap chips for these demo accounts.
 | Home    | Live salons near Indiranagar, ratings, walk-in queue, popular services, artists |
 | Book    | Salon → services → artist/date/time → confirm. 5-minute hold, OTP gate, booking code + check-in PIN |
 | Visits  | Customer booking history, statuses, check-in PIN, cancel                     |
-| Admin   | Owner-gated: 30-day revenue, retention, reminder conversion, revenue by artist, live queue, day book with check-in and POS billing (UPI / cash) |
+| Admin   | Owner-gated: 30-day revenue, retention, reminder conversion, revenue by artist, live queue, day book with check-in and POS billing (UPI / cash), reminder funnel, settlements, CRM and review alerts |
 
 Booking works while signed out: choosing a slot and tapping **Sign in & confirm** opens the
 OTP sheet and, once verified, automatically completes the hold and booking.
@@ -55,8 +55,15 @@ OTP sheet and, once verified, automatically completes the hold and booking.
 
 - Money arrives as integer **paise** and is formatted with `rupees()` (Indian grouping, no Intl
   dependency). Timestamps are rendered in **Asia/Kolkata** by `istTime` / `istDateTime`.
-- Sessions live in memory only (`store.ts`). Closing the app signs you out; persisting the
-  token would need `expo-secure-store`, which is not installed.
+- Sessions are persisted with `expo-secure-store` (or `localStorage` on web) and refreshed with
+  the rotating refresh token. `store.ts` calls `hydrate()` on launch.
 - `api.ts` is the whole network layer: OTP, discovery, availability, hold/create/cancel,
-  partner dashboard, day book, queue, status transitions and invoicing.
+  partner dashboard, day book, queue, status transitions, invoicing, CRM, reminder funnel,
+  settlements, reviews and device-token registration.
+- Push delivery is implemented server-side (Expo Push API) and the app can register a token via
+  `POST /users/me/devices`. Shipping the notification prompt itself needs `expo-notifications`,
+  which is not installed in this workspace.
 - Charts are plain progress bars rather than Victory, so there is no extra native dependency.
+- Expo web export still fails on NativeBase / React Aria transitive web dependencies. Use
+  `salon-web` for the browser and a native simulator/device for this app.
+

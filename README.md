@@ -75,17 +75,40 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 Implemented and verified: OTP auth with single-flight token refresh on web and Expo,
 discovery search, availability, 5-minute slot holds, booking lifecycle, POS invoicing with
 GST and commission split, salon CRM, retention reminder scheduling and provider-backed
-dispatch with retries, walk-in queue, customer reviews with trigger-maintained rating
-aggregates, owner review replies, and admin KYC/commission management. The web app and the
-Expo app both run against the live API.
+dispatch with click tracking, conversion attribution, delivery receipts, opt-outs and retries,
+walk-in queue, customer reviews with trigger-maintained rating aggregates, owner review
+replies, multi-salon switching, customer account settings, owner onboarding/KYC, platform
+admin KYC/commission console, transactional booking/queue/invoice messages, and partner
+settlements. The web app and the Expo app both run against the live API.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs typechecks and the production web build,
-then migrates, seeds and smoke-tests a PostGIS + Redis stack on every push.
+Implemented but **not verified** here because no credentials are configured: real Twilio,
+Meta WhatsApp Cloud and Resend delivery, Razorpay payments/refunds, and S3 uploads. Local and
+CI runs use the console notification provider, `PAYMENT_PROVIDER=manual` (records intent
+only) and report storage as unconfigured. Nothing in the UI claims a message or payment was
+delivered when the provider was not configured.
 
-Real vendor delivery (Twilio, Meta, Resend, webhook) is implemented but **not verified** in
-this repository because no credentials are configured; local/CI delivery uses the console
-provider. Still not implemented: OpenSearch, BullMQ/n8n workers, S3 uploads and the payment
-gateway. Reminders run on an in-process interval or `npm run dispatch` rather than a durable
-queue.
+GitHub Actions (`.github/workflows/ci.yml`) runs typechecks, API unit tests and the
+production web build, then migrates, seeds and smoke-tests a PostGIS + Redis stack on every
+push. `.github/workflows/release.yml` builds and pushes API/web images to GHCR on a `v*` tag.
 
-See `salon-api/README.md` and `salon-web/README.md` for details.
+Still not implemented: OpenSearch, BullMQ/n8n workers, a durable reminder queue (dispatch is
+an in-process interval or `npm run dispatch`), and an in-app push prompt on mobile
+(`expo-notifications` is not installed; the API side resolves registered Expo tokens).
+
+See `salon-api/README.md`, `salon-web/README.md` and `ops/README.md` for details.
+
+## Production
+
+Production images, migrations, health/metrics, backups and the deployment checklist live in
+[`ops/README.md`](ops/README.md). Short version:
+
+```bash
+docker build -t glam-api ./salon-api
+docker build -t glam-web --build-arg NEXT_PUBLIC_API_URL=https://api.example.com/api/v1 ./salon-web
+docker run --rm --env-file .env glam-api node dist/scripts/migrate.js
+docker compose -f docker-compose.prod.yml up -d
+```
+
+`GET /health` reports dependency and provider status; `GET /metrics` exposes Prometheus
+counters. Nightly dumps: `./ops/backup.sh` (Linux) or `./ops/backup.ps1` (Windows).
+

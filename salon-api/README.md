@@ -69,10 +69,12 @@ Useful scripts:
 | Script              | Purpose                                                    |
 | ------------------- | ---------------------------------------------------------- |
 | `npm run dev`       | `tsx watch src/index.ts`                                   |
-| `npm run build`     | TypeScript compile to `dist/`                              |
+| `npm run build`     | TypeScript compile to `dist/` (`dist/src/index.js`)        |
 | `npm start`         | Run the compiled server                                    |
-| `npm run typecheck` | `tsc --noEmit`                                             |
+| `npm run typecheck` | `tsc --noEmit` across src, scripts and tests               |
+| `npm test`          | Unit tests (signatures, storage keys/presign, rendering)   |
 | `npm run migrate`   | Apply pending migrations                                   |
+| `npm run migrate:prod` | Apply migrations from the compiled build                |
 | `npm run seed`      | Load the deterministic demo dataset                        |
 | `npm run db:reset`  | Drop the `public` schema (destructive)                     |
 | `npm run dispatch`  | One-shot reminder dispatch (cron-friendly, no HTTP)        |
@@ -144,9 +146,19 @@ src/
     analytics.ts      owner dashboard under the tenant GUC
     queue.ts          walk-in tokens and estimated waits
     discovery.ts      geo search, ranking, profile, compare
-    notifications.ts  provider adapters, routing, OTP message
+    notifications.ts  provider adapters (console, webhook, Twilio, Meta, Resend, Expo), routing, OTP copy
     dispatcher.ts     due-reminder delivery, Redis locks, retries, interval runner
-db/migrations/        001_extensions … 011_reminder_delivery
+    engagement.ts     click tracking, conversion attribution, delivery events, opt-out, funnel
+    transactional.ts  booking/queue/invoice message dispatch through the provider layer
+    payments.ts       payment intents, Razorpay orders/verify/webhook, refunds, settlements
+    storage.ts        S3 SigV4 presigned PUTs without the AWS SDK
+    signatures.ts     Twilio/Meta/Razorpay signature verification
+    rendering.ts      pure reminder + transactional message copy
+    opt-out.ts        STOP/unsubscribe detection
+  metrics.ts          dependency-free Prometheus counters
+  routes/public.ts    /r/:token click redirect and provider callbacks (no /api/v1 prefix)
+db/migrations/        001_extensions … 012_engagement_payments_ops
+test/                 unit tests (node:test via tsx)
 scripts/              migrate, seed, reset, dispatch, smoke
 ```
 
@@ -167,12 +179,22 @@ scripts/              migrate, seed, reset, dispatch, smoke
 
 **Partner** `/partner/salons` · `/partner/salon` (+ `/submit`) · `/partner/kyc` · `/partner/hygiene` ·
 `/partner/services` · `/partner/staff` (+ schedule, services) · `/partner/resources` ·
-`/partner/bookings` · `/partner/dashboard` · `/partner/invoices` · `/partner/ledger/:customerId` ·
-`/partner/crm` · `/partner/reminders` (+ `/trigger`, `/dispatch`) · `/partner/queue` ·
-`/partner/reviews`
+`/partner/bookings` · `/partner/dashboard` · `/partner/invoices` · `/partner/payments` (+ `/:id/refund`) ·
+`/partner/settlements` · `/partner/ledger/:customerId` · `/partner/crm` ·
+`/partner/reminders` (+ `/trigger`, `/dispatch`, `/analytics`) · `/partner/queue` · `/partner/reviews`
+
+**Payments** `GET /payments/capabilities` · `GET /payments` · `POST /payments/intents` ·
+`POST /payments/:id/verify` (all customer-scoped; intents require `Idempotency-Key`)
+
+**Uploads / devices** `GET /uploads/status` · `POST /uploads/presign` · `PATCH /users/me/avatar` ·
+`POST /users/me/devices` · `DELETE /users/me/devices/:token`
 
 **Admin** `GET /admin/stats` · `GET /admin/kyc` · `POST /admin/kyc/:salonId/review` ·
 `PATCH /admin/salons/:id/commission` · `GET /admin/salons` · `GET /admin/users`
+
+**Public (no `/api/v1`, signature-verified)** `GET /r/:token` · `POST /webhooks/twilio/status` ·
+`POST /webhooks/twilio/inbound` · `GET|POST /webhooks/whatsapp` · `POST /webhooks/razorpay` ·
+`POST /webhooks/notifications` · `GET /health` · `GET /metrics`
 
 Errors always use `{ "error": { "code", "message", "details?" } }`.
 
@@ -181,7 +203,7 @@ Errors always use `{ "error": { "code", "message", "details?" } }`.
 Login codes and retention reminders share one provider layer (`src/services/notifications.ts`)
 with adapters for console, generic webhook, Twilio SMS/WhatsApp, Meta WhatsApp Cloud and
 Resend email. `GET /health` reports the provider resolved for each channel, for example
-`{"SMS":"console","WHATSAPP":"console","EMAIL":"console","PUSH":"console"}`.
+`{"SMS":"console","WHATSAPP":"console","EMAIL":"console","PUSH":"expo"}`.
 
 Reminder dispatch (`src/services/dispatcher.ts`) is at-least-once:
 
@@ -209,9 +231,58 @@ Real vendor delivery is implemented but **unverified in this repository** becaus
 Meta, Resend or webhook credentials are configured. Local runs and CI therefore use the
 console provider and prove routing, consent, receipts and retry state — not carrier delivery.
 
-## 9. Not implemented yet
+### Engagement loop
 
-External integrations still absent by design: OpenSearch, BullMQ/n8n workers, S3 uploads and
-the payment gateway. Reminder delivery uses an in-process interval or cron rather than a
-durable queue. `DEV_RETURN_OTP` remains the only way to log in locally without provider
-credentials.
+- Reminder links point at `GET /r/:token` on the API. The redirect records `CLICKED`
+  (monotonic; it never downgrades a conversion), then sends the customer to
+  `APP_PUBLIC_URL/book?salon=…&ref=<token>`.
+- `POST /bookings` accepts `reminder_token`; a matching booking moves the reminder to
+  `CONVERTED_TO_BOOKING` and writes a `reminder_events` row.
+- Provider callbacks (`/webhooks/twilio/*`, `/webhooks/whatsapp`, `/webhooks/notifications`)
+  apply `DELIVERED`/`OPENED`/`FAILED` by provider message id, again monotonically.
+- Inbound `STOP`/`UNSUBSCRIBE` on SMS or WhatsApp writes a global (salon-less)
+  `RETENTION_REMINDER` revocation and suppresses every pending reminder for that customer.
+- `GET /partner/reminders/analytics` returns the funnel counters shown in the web console.
+
+### WhatsApp compliance
+
+Business-initiated messages need approved templates. Set `WHATSAPP_TEMPLATES_ENABLED=true`
+and `WHATSAPP_TEMPLATE_MAP` (template code → Meta template name) before enabling production
+WhatsApp reminders. Without them the adapter sends free-form text, which only works inside a
+customer service window. Signature checks use `WHATSAPP_APP_SECRET`; webhook verification uses
+`WHATSAPP_VERIFY_TOKEN`.
+
+## 9. Payments, uploads and operations
+
+### Payments
+
+`PAYMENT_PROVIDER` accepts `none`, `manual` (default) or `razorpay`.
+
+- `manual` records pay-at-salon **intent only**. It never captures money; `GET
+  /payments/capabilities` says so and the UI labels it accordingly.
+- `razorpay` creates real orders via the live API, verifies checkout signatures, and handles
+  `payment.captured`, `payment.failed` and `refund.processed` webhooks. Refunds call
+  `/payments/:id/refund` upstream.
+- Partner settlement figures are computed from captured invoices in Asia/Kolkata days.
+  Payout execution depends on the provider; the API reports commission and partner net.
+
+### Uploads
+
+`POST /uploads/presign` returns a 15-minute SigV4 `PUT` URL. Allowed types are JPEG, PNG, WebP
+and PDF. KYC uploads require the salon owner (or a platform admin) and a `salon_id`. The API
+never proxies file bytes. Without `S3_BUCKET`/keys the endpoint returns
+`503 STORAGE_NOT_CONFIGURED` and the web UI says storage is not configured.
+
+### Health, metrics and backups
+
+- `GET /health` → database/Redis checks plus resolved providers and payment/storage capability.
+- `GET /metrics` → Prometheus text counters (HTTP, webhooks, reminder delivery/opt-out/conversion,
+  payment capture/refund). Disable with `METRICS_ENABLED=false`.
+- Unit tests: `npm test` (signatures, storage key/presign shape, message rendering, opt-out).
+- Docker, migrations, backups and the deployment checklist: [`../ops/README.md`](../ops/README.md).
+
+## 10. Not implemented yet
+
+OpenSearch, BullMQ/n8n workers and a durable reminder queue (dispatch is an in-process interval
+or cron). `DEV_RETURN_OTP` remains the only way to log in locally without provider credentials.
+Real carrier/payment/storage delivery is implemented but unverified here without credentials.

@@ -11,8 +11,15 @@ import { bookingRoutes } from './routes/bookings.js';
 import { queueRoutes } from './routes/queue.js';
 import { partnerRoutes } from './routes/partner.js';
 import { adminRoutes } from './routes/admin.js';
+import { publicRoutes } from './routes/public.js';
+import { paymentRoutes } from './routes/payments.js';
+import { uploadRoutes } from './routes/uploads.js';
+import { deviceRoutes } from './routes/devices.js';
 import { startReminderDispatcher, type DispatchLog } from './services/dispatcher.js';
 import { notifier } from './services/notifications.js';
+import { paymentCapabilities } from './services/payments.js';
+import { storageProviderName } from './services/storage.js';
+import { incrementMetric, renderMetrics } from './metrics.js';
 
 export async function buildApp() {
   const app = Fastify({
@@ -94,16 +101,36 @@ export async function buildApp() {
       status: healthy ? 'ok' : 'degraded',
       checks,
       notifications: notifier.describe(),
+      payments: paymentCapabilities(),
+      storage: storageProviderName(),
       time: new Date().toISOString(),
     });
   });
 
+  if ((env.METRICS_ENABLED ?? 'true') !== 'false') {
+    app.get('/metrics', async (_req, reply) => {
+      reply.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      return reply.send(renderMetrics());
+    });
+  }
+
+  await app.register(publicRoutes);
   await app.register(authRoutes, { prefix: '/api/v1' });
   await app.register(discoveryRoutes, { prefix: '/api/v1' });
   await app.register(bookingRoutes, { prefix: '/api/v1' });
   await app.register(queueRoutes, { prefix: '/api/v1' });
   await app.register(partnerRoutes, { prefix: '/api/v1' });
   await app.register(adminRoutes, { prefix: '/api/v1' });
+  await app.register(paymentRoutes, { prefix: '/api/v1' });
+  await app.register(uploadRoutes, { prefix: '/api/v1' });
+  await app.register(deviceRoutes, { prefix: '/api/v1' });
+
+  app.addHook('onResponse', async (req, reply) => {
+    incrementMetric(`glamconnect_http_requests_total`);
+    incrementMetric(`glamconnect_http_${Math.floor(reply.statusCode / 100)}xx_total`);
+    if (reply.statusCode >= 500) incrementMetric('glamconnect_http_5xx_total');
+    void req;
+  });
 
   return app;
 }

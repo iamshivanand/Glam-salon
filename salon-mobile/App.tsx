@@ -32,8 +32,12 @@ import {
   myBookings,
   nextDays,
   partnerBookings,
+  partnerCrm,
   partnerDashboard,
   partnerQueue,
+  partnerReminderFunnel,
+  partnerReviews,
+  partnerSettlements,
   rupees,
   searchSalons,
   todayIST,
@@ -733,6 +737,26 @@ function Admin() {
     queryFn: partnerQueue,
     enabled: owner,
   });
+  const funnel = useQuery({
+    queryKey: ['partner', 'reminders', 'analytics'],
+    queryFn: partnerReminderFunnel,
+    enabled: owner,
+  });
+  const crm = useQuery({
+    queryKey: ['partner', 'crm'],
+    queryFn: partnerCrm,
+    enabled: owner,
+  });
+  const reviews = useQuery({
+    queryKey: ['partner', 'reviews'],
+    queryFn: partnerReviews,
+    enabled: owner,
+  });
+  const settlements = useQuery({
+    queryKey: ['partner', 'settlements'],
+    queryFn: partnerSettlements,
+    enabled: owner,
+  });
 
   const update = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => updateBookingStatus(id, status),
@@ -858,6 +882,51 @@ function Admin() {
             </Box>
           </>
         )}
+
+        <Box bg="white" p={3} borderRadius={22}>
+          <Text bold mb={2}>Retention & settlements</Text>
+          <HStack space={2} flexWrap="wrap">
+            {[
+              ['Sent', funnel.data?.funnel.sent ?? 0],
+              ['Clicked', funnel.data?.funnel.clicked ?? 0],
+              ['Converted', funnel.data?.funnel.converted ?? 0],
+            ].map(([label, value]) => (
+              <VStack key={String(label)} bg="coolGray.50" p={2} borderRadius={12} flex={1}>
+                <Text fontSize="xs" color="coolGray.500">{label}</Text>
+                <Text bold fontSize="lg">{value}</Text>
+              </VStack>
+            ))}
+          </HStack>
+          <Divider my={2} />
+          <HStack justifyContent="space-between">
+            <Text fontSize="sm">Partner payout</Text>
+            <Text bold fontSize="sm">{rupees(settlements.data?.totals.partner_paise ?? 0)}</Text>
+          </HStack>
+          <Text fontSize="xs" color="coolGray.500">
+            {settlements.data?.totals.invoices ?? 0} captured invoices · commission {rupees(settlements.data?.totals.commission_paise ?? 0)}
+          </Text>
+        </Box>
+
+        <Box bg="white" p={3} borderRadius={22}>
+          <HStack justifyContent="space-between" alignItems="baseline">
+            <Text bold>Customers</Text>
+            <Text fontSize="xs" color="coolGray.500">{reviews.data?.open_alerts ?? 0} open review alerts</Text>
+          </HStack>
+          {(crm.data?.customers ?? []).slice(0, 5).map((c) => (
+            <HStack key={c.customer_id} justifyContent="space-between" py={2} borderBottomWidth={1} borderColor="coolGray.100">
+              <VStack flex={1} pr={2}>
+                <Text fontSize="sm" bold>{c.customer_name}</Text>
+                <Text fontSize="xs" color="coolGray.500">
+                  {c.retention_segment} · {c.total_visits} visits · {c.loyalty_points_balance} pts
+                </Text>
+              </VStack>
+              <Text fontSize="sm">{rupees(c.total_spend_paise)}</Text>
+            </HStack>
+          ))}
+          {!crm.data?.customers.length && (
+            <Text fontSize="sm" color="coolGray.500" mt={2}>No CRM customers yet.</Text>
+          )}
+        </Box>
 
         <Box bg="white" p={3} borderRadius={22}>
           <Text bold mb={2}>Live queue</Text>

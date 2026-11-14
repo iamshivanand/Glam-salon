@@ -9,6 +9,8 @@ import { createInvoice } from '../services/invoices.js';
 import { listReminders, triggerReminders } from '../services/reminders.js';
 import { dispatchReminders } from '../services/dispatcher.js';
 import { liveQueue, updateQueueStatus } from '../services/queue.js';
+import { reminderFunnel } from '../services/engagement.js';
+import { listPaymentsForSalon, refundPayment, settlementsForSalon } from '../services/payments.js';
 import { fmtLocalDate } from '../services/availability.js';
 
 const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
@@ -161,6 +163,22 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       );
       return salon;
     });
+  });
+
+  app.get('/partner/salons', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+    const rows = await query(
+      `SELECT s.id, s.name, s.slug, s.city, s.locality, s.verification_status, s.is_active,
+              s.avg_rating, s.review_count,
+              (SELECT COUNT(*)::int FROM bookings b WHERE b.salon_id = s.id
+                AND b.scheduled_start_at >= NOW() AND b.status IN ('REQUESTED','CONFIRMED','ARRIVED','IN_SERVICE')
+              ) AS upcoming_bookings
+         FROM salons s
+        WHERE ($2 = 'PLATFORM_ADMIN' OR s.owner_id = $1)
+        ORDER BY s.created_at`,
+      [req.auth!.id, req.auth!.role],
+    );
+    const active = await resolveSalonId(req);
+    return { salons: rows, active_salon_id: active };
   });
 
   app.get('/partner/salon', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
@@ -660,8 +678,41 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { totals, invoices };
   });
 
-  app.get('/partner/ledger/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  app.get('/partner/payments', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
+    const q = parse(z.object({ limit: z.coerce.number().int().min(1).max(200).optional() }), req.query);
+    return { payments: await listPaymentsForSalon(salonId, q.limit ?? 100) };
+  });
+
+  app.post('/partner/payments/:id/refund', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
+    const salonId = await resolveSalonId(req);
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        amount_paise: z.number().int().positive().optional(),
+        reason: z.string().max(255).optional(),
+      }),
+      req.body ?? {},
+    );
+    return refundPayment({
+      salonId,
+      paymentId: id,
+      amountPaise: body.amount_paise,
+      reason: body.reason,
+      actorId: req.auth!.id,
+    });
+  });
+
+  app.get('/partner/settlements', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+    const salonId = await resolveSalonId(req);
+    const q = parse(
+      z.object({ from: z.string().optional(), to: z.string().optional() }),
+      req.query,
+    );
+    return settlementsForSalon(salonId, { from: q.from, to: q.to });
+  });
+
+  app.get('/partner/ledger/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {    const salonId = await resolveSalonId(req);
     const { customerId } = req.params as { customerId: string };
     const entries = await query(
       `SELECT * FROM customer_value_ledger
@@ -769,6 +820,11 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       status: q.status ? q.status.split(',') : undefined,
       from: q.from,
     });
+  });
+
+  app.get('/partner/reminders/analytics', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+    const salonId = await resolveSalonId(req);
+    return { funnel: await reminderFunnel(salonId) };
   });
 
   app.post('/partner/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {

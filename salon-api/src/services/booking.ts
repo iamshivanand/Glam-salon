@@ -6,12 +6,15 @@ import { badRequest, conflict, forbidden, notFound } from '../http.js';
 import {
   assertSlotAvailable,
   fmtLocalDate,
+  fmtLocalTime,
   getSalonOrThrow,
   loadServices,
   priceOf,
   totalDuration,
 } from './availability.js';
 import { suppressReminders } from './reminders.js';
+import { attributeReminderBooking } from './engagement.js';
+import { queueTransactional } from './transactional.js';
 
 const HOLD_TTL_SEC = 300;
 const SLOT_STEP_MS = 15 * 60_000;
@@ -48,8 +51,7 @@ function lockKey(salonId: string, staffId: string, dateISO: string, minuteIndex:
   return `lock:slot:${salonId}:${staffId}:${dateISO.replace(/-/g, '')}:${minuteIndex}`;
 }
 
-async function acquireSlotLocks(payload: Omit<HoldPayload, 'lock_keys' | 'hold_token'>): Promise<string[]> {
-  const dateISO = fmtLocalDate(new Date(payload.start_at));
+async function acquireSlotLocks(payload: Omit<HoldPayload, 'lock_keys' | 'hold_token'>): Promise<string[]> {  const dateISO = fmtLocalDate(new Date(payload.start_at));
   const dayStart = new Date(`${dateISO}T00:00:00+05:30`).getTime();
   const startMs = new Date(payload.start_at).getTime();
   const endMs = new Date(payload.end_at).getTime();
@@ -65,6 +67,37 @@ async function acquireSlotLocks(payload: Omit<HoldPayload, 'lock_keys' | 'hold_t
     keys.push(key);
   }
   return keys;
+}
+
+interface BookingNoticeContext {
+  customerName: string;
+  salonName: string;
+  serviceName?: string;
+  whenLocal: string;
+  bookingCode?: string;
+}
+
+async function bookingNoticeContext(booking: any, serviceName?: string): Promise<BookingNoticeContext> {
+  const salon = await one<{ name: string }>(`SELECT name FROM salons WHERE id = $1`, [booking.salon_id]);
+  const customer = await one<{ full_name: string }>(`SELECT full_name FROM users WHERE id = $1`, [
+    booking.customer_id,
+  ]);
+  const start = new Date(booking.scheduled_start_at);
+  return {
+    customerName: customer?.full_name ?? 'there',
+    salonName: salon?.name ?? 'your salon',
+    serviceName,
+    whenLocal: `${fmtLocalDate(start)} ${fmtLocalTime(start)}`,
+    bookingCode: booking.booking_code,
+  };
+}
+
+async function firstServiceName(bookingId: string): Promise<string | undefined> {
+  const row = await one<{ service_name_snapshot: string }>(
+    `SELECT service_name_snapshot FROM booking_items WHERE booking_id = $1 ORDER BY time_range LIMIT 1`,
+    [bookingId],
+  );
+  return row?.service_name_snapshot ?? undefined;
 }
 
 export async function holdBooking(opts: {
@@ -130,6 +163,8 @@ export async function createBooking(opts: {
   customerNotes?: string;
   idempotencyKey: string;
   channel?: string;
+  reminderToken?: string;
+  attributionChannel?: string | null;
 }): Promise<any> {
   const hold = await getHold(opts.holdToken);
   if (hold.customer_id !== opts.customerId) throw forbidden('This hold belongs to another customer');
@@ -201,11 +236,29 @@ export async function createBooking(opts: {
         [row.id, opts.customerId, status],
       );
 
+      if (opts.reminderToken) {
+        await attributeReminderBooking(client, {
+          token: opts.reminderToken,
+          salonId: hold.salon_id,
+          bookingId: row.id,
+        });
+      }
+
       await suppressReminders(client, opts.customerId, hold.salon_id);
       return row;
     });
 
     await releaseHold(hold);
+
+    const notice = await bookingNoticeContext(booking, hold.services[0]?.name);
+    queueTransactional({
+      template: instant ? 'BOOKING_CONFIRMED' : 'BOOKING_REQUESTED',
+      userId: opts.customerId,
+      salonId: hold.salon_id,
+      context: notice,
+      data: { booking_id: booking.id, booking_code: booking.booking_code },
+    });
+
     return {
       id: booking.id,
       booking_code: booking.booking_code,
@@ -268,7 +321,7 @@ export async function rescheduleBooking(opts: {
   const services = await loadServices(booking.salon_id, serviceIds);
 
   try {
-    return await tx(async (client) => {
+    const updated = await tx(async (client) => {
       await client.query('SELECT set_config($1, $2, true)', ['app.current_salon_id', booking.salon_id]);
       await client.query(
         `UPDATE bookings
@@ -318,6 +371,18 @@ export async function rescheduleBooking(opts: {
 
       return one(`SELECT * FROM bookings WHERE id = $1`, [opts.bookingId]);
     });
+
+    if (updated) {
+      const notice = await bookingNoticeContext(updated, services[0]?.custom_name);
+      queueTransactional({
+        template: 'BOOKING_RESCHEDULED',
+        userId: booking.customer_id,
+        salonId: booking.salon_id,
+        context: notice,
+        data: { booking_id: opts.bookingId },
+      });
+    }
+    return updated;
   } catch (err: any) {
     if (err?.code === '23P01') throw conflict('SLOT_TAKEN', 'The new slot is no longer available');
     throw err;
@@ -336,7 +401,7 @@ export async function cancelBooking(opts: {
   }
   const partial = Array.isArray(opts.cancelItemIds) && opts.cancelItemIds.length > 0;
 
-  return tx(async (client) => {
+  const result = await tx(async (client) => {
     await client.query('SELECT set_config($1, $2, true)', ['app.current_salon_id', booking.salon_id]);
 
     if (partial) {
@@ -389,6 +454,18 @@ export async function cancelBooking(opts: {
       refund_due_paise: 0,
     };
   });
+
+  if (!partial) {
+    const notice = await bookingNoticeContext(booking, await firstServiceName(opts.bookingId));
+    queueTransactional({
+      template: 'BOOKING_CANCELLED',
+      userId: booking.customer_id,
+      salonId: booking.salon_id,
+      context: { ...notice, reason: opts.reason },
+      data: { booking_id: opts.bookingId },
+    });
+  }
+  return result;
 }
 
 const TRANSITIONS: Record<string, string[]> = {
@@ -413,7 +490,7 @@ export async function updateBookingStatus(opts: {
     throw badRequest('INVALID_CHECKIN_PIN', 'The check-in PIN does not match');
   }
 
-  return tx(async (client) => {
+  const updated = await tx(async (client) => {
     await client.query('SELECT set_config($1, $2, true)', ['app.current_salon_id', booking.salon_id]);
     await client.query(`UPDATE bookings SET status = $2 WHERE id = $1`, [opts.bookingId, opts.status]);
     if (['ARRIVED', 'IN_SERVICE', 'COMPLETED', 'NO_SHOW'].includes(opts.status)) {
@@ -427,6 +504,26 @@ export async function updateBookingStatus(opts: {
     );
     return one(`SELECT * FROM bookings WHERE id = $1`, [opts.bookingId]);
   });
+
+  const template =
+    opts.status === 'CONFIRMED'
+      ? 'BOOKING_CONFIRMED'
+      : opts.status === 'COMPLETED'
+        ? 'BOOKING_COMPLETED'
+        : opts.status === 'CANCELLED_BY_SALON'
+          ? 'BOOKING_CANCELLED'
+          : null;
+  if (template && updated) {
+    const notice = await bookingNoticeContext(updated, await firstServiceName(opts.bookingId));
+    queueTransactional({
+      template,
+      userId: updated.customer_id,
+      salonId: updated.salon_id,
+      context: notice,
+      data: { booking_id: opts.bookingId },
+    });
+  }
+  return updated;
 }
 
 export async function createReview(opts: {

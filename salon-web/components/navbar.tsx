@@ -18,11 +18,22 @@ function AuthButton() {
     );
   }
 
+  const roleLabel =
+    user.role === 'PLATFORM_ADMIN'
+      ? 'admin'
+      : user.role === 'SALON_MANAGER'
+        ? 'manager'
+        : user.role === 'STAFF'
+          ? 'staff'
+          : isOwner(user)
+            ? 'owner'
+            : null;
+
   return (
     <div className="flex items-center gap-2">
       <span className="hidden sm:inline text-sm">
         {user.full_name.split(' ')[0]}
-        {isOwner(user) && <span className="ml-1 text-[10px] uppercase tracking-wide text-accent">owner</span>}
+        {roleLabel && <span className="ml-1 text-[10px] uppercase tracking-wide text-accent">{roleLabel}</span>}
       </span>
       <button onClick={logout} className="text-xs underline opacity-60 hover:opacity-100">
         Sign out
@@ -43,12 +54,23 @@ export function Navbar() {
           <Link href="/services">Services</Link>
           <Link href="/book">Book</Link>
           <Link href="/appointments">My visits</Link>
+          <Link href="/account">Account</Link>
           <Link href="/admin" className="font-semibold">For salons</Link>
         </nav>
         <div className="ml-auto flex items-center gap-3">
           {user && isOwner(user) && (
             <Link href="/admin" className="hidden sm:inline chip !py-2">
               Dashboard
+            </Link>
+          )}
+          {user?.role === 'PLATFORM_ADMIN' && (
+            <Link href="/platform" className="hidden sm:inline chip !py-2">
+              Platform
+            </Link>
+          )}
+          {user && (
+            <Link href="/account" className="hidden sm:inline chip !py-2">
+              Account
             </Link>
           )}
           <AuthButton />

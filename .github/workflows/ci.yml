@@ -29,6 +29,10 @@ jobs:
         working-directory: salon-api
         run: npm run typecheck
 
+      - name: API unit tests
+        working-directory: salon-api
+        run: npm test
+
       - name: API build
         working-directory: salon-api
         run: npm run build

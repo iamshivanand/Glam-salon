@@ -5,10 +5,14 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   useAvailability,
   useCreateBooking,
+  useCreatePaymentIntent,
   useHold,
+  usePaymentCapabilities,
   useSalon,
   useSalonSearch,
+  useVerifyPayment,
   rupees,
+  type PaymentIntent,
   type Slot,
 } from '@/lib/api';
 import { useAuth, useAuthModal, useBooking } from '@/lib/store';
@@ -16,6 +20,17 @@ import { serviceImage, staffImage } from '@/lib/images';
 
 function todayIST() {
   return new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
+}
+
+function loadScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('Could not load the payment checkout'));
+    document.body.appendChild(script);
+  });
 }
 
 export default function BookPage() {
@@ -28,6 +43,10 @@ export default function BookPage() {
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [resumeAfterSignIn, setResumeAfterSignIn] = useState(false);
+  const [reminderToken, setReminderToken] = useState<string | undefined>();
+  const [payMode, setPayMode] = useState<'PAY_AT_SALON' | 'PAY_ONLINE'>('PAY_AT_SALON');
+  const [paymentIntent, setPaymentIntent] = useState<PaymentIntent | null>(null);
+  const [paymentNotice, setPaymentNotice] = useState<string | null>(null);
 
   const { data: search } = useSalonSearch({ lat: 12.9719, lng: 77.6412, radius_km: 15 });
   const salons = search?.salons ?? [];
@@ -40,12 +59,19 @@ export default function BookPage() {
   const availability = useAvailability(activeSalonId, b.serviceIds, b.date, b.staffId);
   const hold = useHold();
   const create = useCreateBooking();
+  const capabilities = usePaymentCapabilities();
+  const createIntent = useCreatePaymentIntent();
+  const verifyPayment = useVerifyPayment();
 
   useEffect(() => {
     if (b.date < todayIST()) b.set({ date: todayIST() });
-    // Reminder deep links carry ?salon=<id>; select it before the flow starts.
-    const linkedSalon = new URLSearchParams(window.location.search).get('salon');
+    // Reminder deep links carry ?salon=<id>&ref=<token>; keep the token so the
+    // booking can be attributed back to the reminder that brought them here.
+    const params = new URLSearchParams(window.location.search);
+    const linkedSalon = params.get('salon');
     if (linkedSalon) useBooking.getState().setSalon(linkedSalon);
+    const ref = params.get('ref');
+    if (ref) setReminderToken(ref);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -80,8 +106,19 @@ export default function BookPage() {
         staff_id: slot.staff_id,
         start_at: slot.start_at,
       });
-      const booking = await create.mutateAsync({ hold_token: held.hold_token });
+      const booking = await create.mutateAsync({ hold_token: held.hold_token, reminder_token: reminderToken });
       setConfirmation(booking);
+      if (payMode === 'PAY_ONLINE') {
+        try {
+          const intent = await createIntent.mutateAsync({ booking_id: booking.id });
+          setPaymentIntent(intent);
+          if (!intent.checkout) {
+            setPaymentNotice(intent.instructions ?? 'Online payment is not configured; pay at the salon.');
+          }
+        } catch (err: any) {
+          setPaymentNotice(`Booking saved. Online payment is unavailable: ${err.message}`);
+        }
+      }
       setStep(4);
       b.reset();
     } catch (err: any) {
@@ -97,6 +134,35 @@ export default function BookPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, resumeAfterSignIn]);
 
+  const payNow = async () => {
+    if (!paymentIntent?.checkout) return;
+    setPaymentNotice(null);
+    try {
+      await loadScript('https://checkout.razorpay.com/v1/checkout.js');
+      const checkout = paymentIntent.checkout;
+      const rzp = new (window as any).Razorpay({
+        key: checkout.key,
+        amount: checkout.amount,
+        currency: checkout.currency,
+        order_id: checkout.order_id,
+        name: 'Glam Connect',
+        description: confirmation?.booking_code,
+        handler: async (response: any) => {
+          try {
+            await verifyPayment.mutateAsync({ paymentId: paymentIntent.payment_id, ...response });
+            setPaymentNotice('Payment captured. A receipt has been queued.');
+          } catch (err: any) {
+            setPaymentNotice(err.message);
+          }
+        },
+        theme: { color: '#7c3aed' },
+      });
+      rzp.open();
+    } catch (err: any) {
+      setPaymentNotice(err.message);
+    }
+  };
+
   if (confirmation) {
     return (
       <div className="card p-10 mt-8 text-center max-w-xl mx-auto">
@@ -111,7 +177,11 @@ export default function BookPage() {
           <span className="text-xs opacity-60 mt-2">Check-in PIN</span>
           <span className="tracking-[0.4em] text-lg">{confirmation.checkin_pin}</span>
         </div>
-        <p className="text-sm opacity-60 mt-4">Total {rupees(confirmation.total_payable_paise)} · pay at the salon</p>
+        <p className="text-sm opacity-60 mt-4">Total {rupees(confirmation.total_payable_paise)} · {payMode === 'PAY_ONLINE' ? 'online payment' : 'pay at the salon'}</p>
+        {paymentIntent?.checkout && !paymentNotice?.startsWith('Payment captured') && (
+          <button onClick={payNow} className="btn-accent mt-3">Pay {rupees(paymentIntent.amount_paise)} now</button>
+        )}
+        {paymentNotice && <p className="text-sm mt-3 opacity-80">{paymentNotice}</p>}
         <div className="flex gap-2 justify-center mt-6">
           <Link href="/appointments" className="btn-primary">View my visits</Link>
           <button onClick={() => setConfirmation(null)} className="chip">Book another</button>
@@ -247,6 +317,25 @@ export default function BookPage() {
           <p className="text-sm opacity-70">
             {profile?.name} · {b.date} at {b.time} · {user ? user.full_name : 'Sign in to confirm'}
           </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => setPayMode('PAY_AT_SALON')}
+              className={`chip !py-2 ${payMode === 'PAY_AT_SALON' ? 'chip-active' : ''}`}
+            >
+              Pay at salon
+            </button>
+            <button
+              onClick={() => setPayMode('PAY_ONLINE')}
+              className={`chip !py-2 ${payMode === 'PAY_ONLINE' ? 'chip-active' : ''}`}
+            >
+              Pay online
+            </button>
+            {payMode === 'PAY_ONLINE' && capabilities.data && !capabilities.data.configured && (
+              <span className="text-[11px] text-amber-700 self-center">
+                Online payment is not configured on this server; the booking will still be saved.
+              </span>
+            )}
+          </div>
           {!hydrated && <p className="text-xs opacity-60">Checking your session…</p>}
           {error && <p className="text-sm text-red-600">{error}</p>}
           <div className="flex gap-2">
@@ -260,7 +349,7 @@ export default function BookPage() {
             </button>
           </div>
           <p className="text-[11px] opacity-50">
-            Your slot is held for 5 minutes while you confirm. Payment is collected at the salon.
+            Your slot is held for 5 minutes while you confirm. Choose pay-at-salon, or pay online when the payment provider is configured.
           </p>
         </div>
       )}

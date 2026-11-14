@@ -50,6 +50,17 @@ export async function withTenant<T>(salonId: string, fn: (client: pg.PoolClient)
   });
 }
 
+/**
+ * Run a transaction with the trusted-integration GUC. Used by inbound provider
+ * webhooks and public reminder click redirects, which have no salon context.
+ */
+export async function withIntegration<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  return tx(async (client) => {
+    await client.query('SELECT set_config($1, $2, true)', ['app.integration', 'true']);
+    return fn(client);
+  });
+}
+
 export async function closeDb(): Promise<void> {
   await pool.end();
 }

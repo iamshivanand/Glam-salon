@@ -1,0 +1,93 @@
+name: Release images
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.names.outputs.api }}
+      web: ${{ steps.names.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image names
+        id: names
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "api=ghcr.io/$owner/glamconnect-api" >> "$GITHUB_OUTPUT"
+          echo "web=ghcr.io/$owner/glamconnect-web" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API
+        uses: docker/build-push-action@v6
+        with:
+          context: ./salon-api
+          push: true
+          tags: |
+            ${{ steps.names.outputs.api }}:${{ github.ref_name }}
+            ${{ steps.names.outputs.api }}:sha-${{ github.sha }}
+            ${{ steps.names.outputs.api }}:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build and push web
+        uses: docker/build-push-action@v6
+        with:
+          context: ./salon-web
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1' }}
+          tags: |
+            ${{ steps.names.outputs.web }}:${{ github.ref_name }}
+            ${{ steps.names.outputs.web }}:sha-${{ github.sha }}
+            ${{ steps.names.outputs.web }}:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  deploy:
+    name: Deploy over SSH
+    needs: images
+    # Opt in per repository: set the variable DEPLOY_ENABLED=true and configure
+    # the `production` environment with DEPLOY_HOST/USER/SSH_KEY/PATH secrets.
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      API_IMAGE: ${{ needs.images.outputs.api }}:${{ github.ref_name }}
+      WEB_IMAGE: ${{ needs.images.outputs.web }}:${{ github.ref_name }}
+    steps:
+      - name: Pull, migrate and restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: API_IMAGE,WEB_IMAGE
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_PATH }}"
+            export API_IMAGE WEB_IMAGE
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml run --rm api node dist/scripts/migrate.js
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f

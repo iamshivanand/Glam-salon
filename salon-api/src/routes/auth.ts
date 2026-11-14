@@ -8,16 +8,10 @@ import { authenticate, issueTokens, rotateRefresh, revokeRefresh } from '../auth
 import { env, devReturnOtp } from '../env.js';
 import { sendOtpCode } from '../services/notifications.js';
 
-const PHONE_RE = /^\+[1-9]\d{9,14}$/;
+import { isValidPhone, normalizePhone } from '../phone.js';
 
-export function normalizePhone(raw: string): string {
-  const trimmed = String(raw ?? '').trim().replace(/[\s()-]/g, '');
-  if (trimmed.startsWith('+')) return trimmed;
-  const digits = trimmed.replace(/\D/g, '');
-  if (digits.length === 10) return `+91${digits}`;
-  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
-  return digits ? `+${digits}` : '';
-}
+export { normalizePhone } from '../phone.js';
+const PHONE_RE = /^\+[1-9]\d{9,14}$/;
 
 const OtpRequest = z.object({ phone: z.string().min(8).max(20) });
 const OtpVerify = z.object({

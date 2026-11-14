@@ -396,5 +396,83 @@ export const createInvoice = (bookingId: string, method: 'UPI_QR' | 'CASH') =>
     body: { booking_id: bookingId, method },
   });
 
+export interface PartnerSalonSummary {
+  id: string;
+  name: string;
+  city: string;
+  locality: string;
+  verification_status: string;
+  upcoming_bookings: number;
+}
+
+export const partnerSalons = () =>
+  api<{ salons: PartnerSalonSummary[]; active_salon_id: string }>('/partner/salons');
+
+export interface CrmCustomer {
+  customer_id: string;
+  customer_name: string;
+  total_visits: number;
+  total_spend_paise: number;
+  retention_segment: string;
+  loyalty_points_balance: number;
+  last_visit_at: string;
+  next_expected_visit_date: string | null;
+}
+
+export const partnerCrm = () => api<{ customers: CrmCustomer[] }>('/partner/crm');
+
+export const partnerReminderFunnel = () =>
+  api<{
+    funnel: {
+      scheduled: number;
+      sent: number;
+      delivered: number;
+      opened: number;
+      clicked: number;
+      converted: number;
+      suppressed: number;
+      failed: number;
+    };
+  }>('/partner/reminders/analytics');
+
+export const triggerReminder = (body: {
+  customer_ids: string[];
+  channel: 'WHATSAPP' | 'SMS' | 'PUSH' | 'EMAIL';
+  template_code: string;
+}) =>
+  api<{ enqueued: number; skipped: number; sent: number; failed: number }>('/partner/reminders/trigger', {
+    method: 'POST',
+    body,
+  });
+
+export interface PartnerReview {
+  id: string;
+  overall_rating: number;
+  hygiene_rating: number;
+  review_text: string | null;
+  owner_reply: string | null;
+  resolution_status: string;
+  customer_name: string;
+  created_at: string;
+}
+
+export const partnerReviews = () =>
+  api<{ open_alerts: number; reviews: PartnerReview[] }>('/partner/reviews');
+
+export const replyToReview = (id: string, ownerReply: string) =>
+  api(`/partner/reviews/${id}/reply`, {
+    method: 'POST',
+    body: { owner_reply: ownerReply, resolution_status: 'RESOLVED' },
+  });
+
+export const partnerSettlements = () =>
+  api<{
+    totals: { gross_paise: number; commission_paise: number; partner_paise: number; invoices: number };
+    days: { settlement_date: string; partner_paise: number }[];
+  }>('/partner/settlements');
+
+export const registerPushToken = (token: string, platform: 'ios' | 'android' | 'web' | 'unknown') =>
+  api('/users/me/devices', { method: 'POST', body: { token, platform, app: 'customer' } });
+
 export const isOwner = (user: SessionUser | null) =>
   !!user && ['SALON_OWNER', 'SALON_MANAGER', 'PLATFORM_ADMIN'].includes(user.role);

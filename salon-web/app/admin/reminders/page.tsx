@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useDispatchReminders, usePartnerCrm, usePartnerReminders, useTriggerReminders } from '@/lib/api';
+import { useDispatchReminders, usePartnerCrm, usePartnerReminders, useReminderFunnel, useTriggerReminders } from '@/lib/api';
 import { useAuth } from '@/lib/store';
 
 const CHANNELS = ['WHATSAPP', 'SMS', 'EMAIL', 'PUSH'] as const;
@@ -9,6 +9,7 @@ const CHANNELS = ['WHATSAPP', 'SMS', 'EMAIL', 'PUSH'] as const;
 export default function AdminReminders() {
   const { user } = useAuth();
   const { data, isLoading } = usePartnerReminders(!!user);
+  const { data: funnelData } = useReminderFunnel(!!user);
   const { data: crm } = usePartnerCrm(!!user);
   const trigger = useTriggerReminders();
   const dispatch = useDispatchReminders();
@@ -52,6 +53,7 @@ export default function AdminReminders() {
   };
 
   const summary = data?.summary;
+  const funnel = funnelData?.funnel;
 
   return (
     <div className="space-y-4">
@@ -68,18 +70,26 @@ export default function AdminReminders() {
         </button>
       </div>
 
-      <div className="grid sm:grid-cols-2 xl:grid-cols-4 gap-4">
+      <div className="grid sm:grid-cols-2 xl:grid-cols-5 gap-4">
         {[
-          ['Sent', summary?.sent],
-          ['Delivered', summary?.delivered],
-          ['Clicked', summary?.clicked],
-          ['Converted', summary?.converted_bookings],
+          ['Sent', funnel?.sent ?? summary?.sent],
+          ['Delivered', funnel?.delivered ?? summary?.delivered],
+          ['Opened', funnel?.opened],
+          ['Clicked', funnel?.clicked ?? summary?.clicked],
+          ['Converted', funnel?.converted ?? summary?.converted_bookings],
         ].map(([label, value]) => (
           <div key={String(label)} className="card p-5">
             <p className="text-xs opacity-60">{label}</p>
             <p className="font-display text-3xl mt-1">{value ?? 0}</p>
           </div>
         ))}
+      </div>
+
+      <div className="flex flex-wrap gap-2 text-[11px] opacity-60">
+        <span className="chip !py-1 !px-2">Scheduled {funnel?.scheduled ?? 0}</span>
+        <span className="chip !py-1 !px-2">Suppressed {funnel?.suppressed ?? 0}</span>
+        <span className="chip !py-1 !px-2">Failed {funnel?.failed ?? 0}</span>
+        <span className="chip !py-1 !px-2">Click-through and conversion update from /r/:token redirects and booking attribution.</span>
       </div>
 
       <div className="card p-5 space-y-3">
@@ -126,7 +136,8 @@ export default function AdminReminders() {
         </div>
         <p className="text-[11px] opacity-50">
           Only customers with a granted RETENTION_REMINDER consent for the chosen channel are sent.
-          Failed deliveries stay queued and retry with backoff. PUSH needs a webhook or device service.
+          Failed deliveries stay queued and retry with backoff. PUSH resolves registered Expo device tokens.
+          Replying STOP opts the customer out immediately.
         </p>
       </div>
 
@@ -158,7 +169,10 @@ export default function AdminReminders() {
                   {r.last_error ? (
                     <span className="text-red-700">{r.last_error}</span>
                   ) : r.provider_message_id ? (
-                    <span className="opacity-70">{r.provider_message_id}</span>
+                    <span className="opacity-70">
+                      {r.provider ? `${r.provider} · ` : ''}
+                      {r.provider_message_id}
+                    </span>
                   ) : (
                     '—'
                   )}

@@ -106,8 +106,13 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     const q = parse(z.object({ status: z.string().optional() }), req.query);
     const rows = await query(
       `SELECT s.id, s.name, s.city, s.locality, s.verification_status, s.is_active,
-              s.avg_rating, s.review_count, u.full_name AS owner_name, s.created_at
-         FROM salons s JOIN users u ON u.id = s.owner_id
+              s.avg_rating, s.review_count, u.full_name AS owner_name, s.created_at,
+              c.plan_tier,
+              c.marketplace_new_client_bps,
+              c.repeat_crm_client_bps
+         FROM salons s
+         JOIN users u ON u.id = s.owner_id
+         LEFT JOIN salon_commission_configs c ON c.salon_id = s.id
         WHERE ($1::text IS NULL OR s.verification_status::text = $1)
         ORDER BY s.created_at DESC`,
       [q.status ?? null],

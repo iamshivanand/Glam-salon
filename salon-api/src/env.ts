@@ -15,8 +15,9 @@ const EnvSchema = z.object({
   PHONE_PEPPER: z.string().min(1),
   DEV_RETURN_OTP: z.string().optional(),
 
-  // Public web origin used in reminder deep links.
+  // Public origins. API_PUBLIC_URL is used for click redirects and provider callbacks.
   APP_PUBLIC_URL: z.string().url().default('http://localhost:3000'),
+  API_PUBLIC_URL: z.string().url().default('http://localhost:4000'),
 
   // Notifications. `auto` picks providers from whichever credentials are present.
   NOTIFICATION_PROVIDER: z
@@ -34,11 +35,42 @@ const EnvSchema = z.object({
   WHATSAPP_ACCESS_TOKEN: z.string().optional(),
   RESEND_API_KEY: z.string().optional(),
   RESEND_FROM: z.string().optional(),
+  TRANSACTIONAL_CHANNEL: z.enum(['SMS', 'WHATSAPP', 'EMAIL']).default('SMS'),
+  DELIVERY_WEBHOOK_SECRET: z.string().optional(),
+  EXPO_ACCESS_TOKEN: z.string().optional(),
+
+  // WhatsApp/Meta compliance. Templates are required for business-initiated
+  // messages; text sends still work inside a customer service window.
+  WHATSAPP_APP_SECRET: z.string().optional(),
+  WHATSAPP_VERIFY_TOKEN: z.string().optional(),
+  WHATSAPP_TEMPLATES_ENABLED: z.string().optional(),
+  // JSON: { "OTP_V1": "otp_verification", "BOOKING_CONFIRMED": "booking_confirmed" }
+  WHATSAPP_TEMPLATE_MAP: z.string().optional(),
+  // JSON: { "OTP_V1": "HX..." } for Twilio Content API templates.
+  TWILIO_CONTENT_SID_MAP: z.string().optional(),
+
+  // Payments. `manual` records pay-at-salon intent; `razorpay` uses the live API.
+  PAYMENT_PROVIDER: z.enum(['none', 'manual', 'razorpay']).default('manual'),
+  RAZORPAY_KEY_ID: z.string().optional(),
+  RAZORPAY_KEY_SECRET: z.string().optional(),
+  RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
+
+  // S3-compatible object storage for KYC documents, avatars and style photos.
+  S3_ENDPOINT: z.string().url().optional(),
+  S3_REGION: z.string().default('ap-south-1'),
+  S3_BUCKET: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_PUBLIC_BASE_URL: z.string().url().optional(),
+  S3_FORCE_PATH_STYLE: z.string().optional(),
 
   // Reminder dispatcher (in-process interval; can also run as a one-shot cron).
   REMINDER_DISPATCH_ENABLED: z.string().optional(),
   REMINDER_DISPATCH_INTERVAL_SEC: z.coerce.number().int().min(1).default(30),
   REMINDER_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+
+  // Operational endpoints.
+  METRICS_ENABLED: z.string().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

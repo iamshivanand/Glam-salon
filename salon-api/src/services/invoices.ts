@@ -2,6 +2,7 @@ import { one, tx } from '../db.js';
 import { badRequest, conflict, notFound } from '../http.js';
 import { randomToken } from '../crypto.js';
 import { scheduleReminders } from './reminders.js';
+import { queueTransactional } from './transactional.js';
 
 const GST_RATE = 0.18;
 const POINT_VALUE_PAISE = 100; // 1 loyalty point = ₹1
@@ -23,7 +24,7 @@ export async function createInvoice(input: InvoiceInput) {
   if (existing) return existing;
 
   try {
-    return await tx(async (client) => {
+    const result = await tx(async (client) => {
       await client.query('SELECT set_config($1, $2, true)', ['app.current_salon_id', input.salonId]);
 
       let customerId: string;
@@ -241,6 +242,23 @@ export async function createInvoice(input: InvoiceInput) {
 
       return { ...invoice, earned_points: earnedPoints, redeemed_points: redeemPoints };
     });
+
+    const customer = await one<{ full_name: string }>(`SELECT full_name FROM users WHERE id = $1`, [result.customer_id]);
+    const salon = await one<{ name: string }>(`SELECT name FROM salons WHERE id = $1`, [result.salon_id]);
+    queueTransactional({
+      template: 'INVOICE_READY',
+      userId: result.customer_id,
+      salonId: result.salon_id,
+      context: {
+        customerName: customer?.full_name ?? 'there',
+        salonName: salon?.name ?? 'your salon',
+        amountInr: (Number(result.net_collected_paise) / 100).toFixed(2),
+        bookingCode: result.invoice_number,
+      },
+      data: { invoice_id: result.id, booking_id: result.booking_id },
+    });
+
+    return result;
   } catch (err: any) {
     if (err?.code === '23505' && String(err.constraint ?? '').includes('idempotency')) {
       const again = await one(`SELECT * FROM invoices_and_payments WHERE idempotency_key = $1`, [input.idempotencyKey]);

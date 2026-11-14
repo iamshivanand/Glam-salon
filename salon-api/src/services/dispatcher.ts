@@ -8,6 +8,7 @@ import {
   type NotificationChannel,
   type Notifier,
 } from './notifications.js';
+import { renderReminderMessage } from './rendering.js';
 
 export interface DispatchLog {
   info: (obj: object, msg?: string) => void;
@@ -47,7 +48,7 @@ function logError(err: unknown): string {
 
 function destinationFor(row: DueReminder): string | null {
   if (row.channel === 'EMAIL') return row.email;
-  if (row.channel === 'PUSH') return `customer:${row.customer_id}`;
+  if (row.channel === 'PUSH') return null; // resolved from device_push_tokens
   if (!row.phone_e164_encrypted) return null;
   try {
     return decrypt(row.phone_e164_encrypted);
@@ -56,34 +57,16 @@ function destinationFor(row: DueReminder): string | null {
   }
 }
 
-export function renderReminder(row: DueReminder): { subject: string; text: string } {
-  const firstName = row.customer_name.split(' ')[0] || 'there';
-  const base = env.APP_PUBLIC_URL.replace(/\/$/, '');
-  const link = `${base}/book?salon=${row.salon_id}&ref=${row.deep_link_token}`;
-  const service = row.category_name.toLowerCase();
+async function pushTokens(userId: string): Promise<string[]> {
+  const rows = await query<{ token: string }>(
+    `SELECT token FROM device_push_tokens WHERE user_id = $1 ORDER BY last_seen_at DESC LIMIT 5`,
+    [userId],
+  );
+  return rows.map((r) => r.token);
+}
 
-  switch (row.template_code) {
-    case 'DAY_20_GENTLE':
-      return {
-        subject: `${firstName}, your ${service} is coming up`,
-        text: `Hi ${firstName}, it's almost time for your next ${service} at ${row.salon_name}. Pick a slot that suits you: ${link}`,
-      };
-    case 'DAY_25_INVITE':
-      return {
-        subject: `${firstName}, book your ${service} at ${row.salon_name}`,
-        text: `Hi ${firstName}, your ${service} at ${row.salon_name} is due around now. Reserve your preferred time: ${link}`,
-      };
-    case 'DAY_35_REENGAGE':
-      return {
-        subject: `We miss you at ${row.salon_name}`,
-        text: `Hi ${firstName}, it has been a while since your last ${service} at ${row.salon_name}. Treat yourself and book again: ${link}`,
-      };
-    default:
-      return {
-        subject: `A note from ${row.salon_name}`,
-        text: `Hi ${firstName}, ${row.salon_name} would love to see you again. Book your next visit: ${link}`,
-      };
-  }
+export function renderReminder(row: DueReminder): { subject: string; text: string } {
+  return renderReminderMessage(row, env.API_PUBLIC_URL);
 }
 
 async function markSuppressed(salonId: string, id: string): Promise<void> {
@@ -108,12 +91,13 @@ async function markSent(
       `UPDATE retention_reminders
           SET status = 'SENT',
               sent_at = NOW(),
+              provider = $3,
               provider_message_id = $2,
               delivery_attempts = delivery_attempts + 1,
               last_error = NULL,
               next_attempt_at = NULL
         WHERE id = $1`,
-      [id, messageId ?? provider],
+      [id, messageId, provider],
     );
   });
 }
@@ -232,33 +216,63 @@ export async function dispatchReminders(
     }
 
     try {
-      const consent = await one<{ is_granted: boolean }>(
-        `SELECT is_granted FROM customer_consents
-          WHERE user_id = $1 AND salon_id = $2 AND channel = $3 AND purpose = 'RETENTION_REMINDER'
-          LIMIT 1`,
+      const consent = await one<{ revoked: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM customer_consents
+            WHERE user_id = $1
+              AND channel = $3
+              AND purpose = 'RETENTION_REMINDER'
+              AND is_granted = FALSE
+              AND (salon_id = $2 OR salon_id IS NULL)
+         ) AS revoked`,
         [row.customer_id, row.salon_id, row.channel],
       );
-      if (!consent?.is_granted) {
+      if (consent?.revoked) {
         await markSuppressed(row.salon_id, row.id);
         result.suppressed += 1;
         opts.log?.info({ reminderId: row.id, channel: row.channel }, 'reminder suppressed: no consent');
         continue;
       }
 
-      const to = destinationFor(row);
-      if (!to) {
-        throw new NotificationError('NO_DESTINATION', `No ${row.channel} destination on file`);
+      const { subject, text } = renderReminder(row);
+      let delivery: { provider: string; messageId: string | null } | null = null;
+
+      if (row.channel === 'PUSH') {
+        const tokens = await pushTokens(row.customer_id);
+        if (!tokens.length) {
+          throw new NotificationError('NO_DESTINATION', 'No push device token on file');
+        }
+        for (const token of tokens) {
+          const sent = await notifier.send({
+            channel: 'PUSH',
+            to: token,
+            subject,
+            text,
+            template: row.template_code,
+            userId: row.customer_id,
+            salonId: row.salon_id,
+            data: { reminder_id: row.id, salon_id: row.salon_id, deep_link_token: row.deep_link_token },
+          });
+          delivery ??= sent;
+        }
+      } else {
+        const to = destinationFor(row);
+        if (!to) {
+          throw new NotificationError('NO_DESTINATION', `No ${row.channel} destination on file`);
+        }
+        delivery = await notifier.send({
+          channel: row.channel,
+          to,
+          subject,
+          text,
+          template: row.template_code,
+          userId: row.customer_id,
+          salonId: row.salon_id,
+          data: { reminder_id: row.id, salon_id: row.salon_id, deep_link_token: row.deep_link_token },
+        });
       }
 
-      const { subject, text } = renderReminder(row);
-      const delivery = await notifier.send({
-        channel: row.channel,
-        to,
-        subject,
-        text,
-        template: row.template_code,
-        data: { reminder_id: row.id, salon_id: row.salon_id },
-      });
+      if (!delivery) throw new NotificationError('NO_PROVIDER', 'Push delivery produced no result');
       await markSent(row.salon_id, row.id, delivery.provider, delivery.messageId);
       result.sent += 1;
       opts.log?.info(

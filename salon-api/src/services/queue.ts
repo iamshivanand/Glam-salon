@@ -3,6 +3,7 @@ import { one, query, tx } from '../db.js';
 import { badRequest, conflict, notFound } from '../http.js';
 import { loadServices } from './availability.js';
 import { fmtLocalDate } from './availability.js';
+import { queueTransactional } from './transactional.js';
 
 const AVG_SERVICE_MINS = 15;
 
@@ -24,9 +25,8 @@ export async function joinQueue(opts: {
   const totalDuration = services.reduce((s, x) => s + x.duration_mins, 0);
   const queueDate = fmtLocalDate(new Date());
 
-  return tx(async (client) => {
+  const result = await tx(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`queue:${opts.salonId}:${queueDate}`]);
-
     const ahead = await client.query<{ n: string; active: string }>(
       `SELECT
          COUNT(*) FILTER (WHERE status = 'WAITING')::int AS n,
@@ -76,6 +76,21 @@ export async function joinQueue(opts: {
       is_estimate_disclaimer: true,
     };
   });
+
+  if (opts.customerId) {
+    queueTransactional({
+      template: 'QUEUE_JOINED',
+      userId: opts.customerId,
+      salonId: opts.salonId,
+      context: {
+        customerName: opts.customerName,
+        salonName: salon.name,
+        tokenNumber: result.token_number,
+      },
+      data: { queue_token_id: result.token_id },
+    });
+  }
+  return result;
 }
 
 export async function liveQueue(salonId: string) {
@@ -119,7 +134,7 @@ export async function updateQueueStatus(opts: {
   const allowed = ['WAITING', 'CALLED', 'IN_SERVICE', 'COMPLETED', 'SKIPPED', 'LEFT_QUEUE'];
   if (!allowed.includes(opts.status)) throw badRequest('VALIDATION_ERROR', 'Invalid queue status');
 
-  return tx(async (client) => {
+  const updated = await tx(async (client) => {
     const token = (
       await client.query(`SELECT * FROM walkin_queue_tokens WHERE id = $1 AND salon_id = $2 FOR UPDATE`, [
         opts.tokenId,
@@ -155,4 +170,20 @@ export async function updateQueueStatus(opts: {
 
     return client.query(`SELECT * FROM walkin_queue_tokens WHERE id = $1`, [opts.tokenId]).then((r) => r.rows[0]);
   });
+
+  if (opts.status === 'CALLED' && updated?.customer_id) {
+    const salon = await one<{ name: string }>(`SELECT name FROM salons WHERE id = $1`, [opts.salonId]);
+    queueTransactional({
+      template: 'QUEUE_CALLED',
+      userId: updated.customer_id,
+      salonId: opts.salonId,
+      context: {
+        customerName: updated.walkin_customer_name ?? 'there',
+        salonName: salon?.name ?? 'the salon',
+        tokenNumber: updated.token_number,
+      },
+      data: { queue_token_id: updated.id },
+    });
+  }
+  return updated;
 }

@@ -1,0 +1,39 @@
+# Production stack. Postgres/Redis are expected to be managed services; set
+# DATABASE_URL, MIGRATE_DATABASE_URL and REDIS_URL in .env on the host.
+#
+#   API_IMAGE=ghcr.io/<owner>/glamconnect-api:v1.0.0 \
+#   WEB_IMAGE=ghcr.io/<owner>/glamconnect-web:v1.0.0 \
+#   docker compose -f docker-compose.prod.yml up -d
+services:
+  api:
+    image: ${API_IMAGE:?set API_IMAGE to the pushed API tag}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  web:
+    image: ${WEB_IMAGE:?set WEB_IMAGE to the pushed web tag}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
