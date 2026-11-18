@@ -1062,6 +1062,28 @@ export function useRevokeAllSessions() {
   });
 }
 
+export function useRevokeSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api<{ revoked: number }>(`/users/me/sessions/${id}/revoke`, { method: 'POST', body: {} }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'sessions'] }),
+  });
+}
+
+export type MyDataExport = {
+  exported_at: string;
+  profile: MyProfile & { phone?: string };
+  addresses: unknown[];
+  bookings: unknown[];
+  invoices: unknown[];
+  reviews: unknown[];
+  consents: unknown[];
+};
+
+export function useExportMyData() {
+  return useMutation({ mutationFn: () => api<MyDataExport>('/users/me/export') });
+}
+
 export function useDeleteAccount() {
   const qc = useQueryClient();
   return useMutation({

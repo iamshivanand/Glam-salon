@@ -11,9 +11,11 @@ import {
   useConsents,
   useDeleteAccount,
   useDeleteAddress,
+  useExportMyData,
   useMe,
   usePayments,
   useRevokeAllSessions,
+  useRevokeSession,
   useSessions,
   useSetAvatar,
   useSetConsent,
@@ -45,6 +47,8 @@ export default function AccountPage() {
   const payments = usePayments(!!user);
   const sessions = useSessions(!!user);
   const revokeAllSessions = useRevokeAllSessions();
+  const revokeSession = useRevokeSession();
+  const exportData = useExportMyData();
   const deleteAccount = useDeleteAccount();
 
   const [form, setForm] = useState({ full_name: '', email: '', gender: '', date_of_birth: '' });
@@ -143,8 +147,38 @@ export default function AccountPage() {
     }
   };
 
-  const removeAccount = async () => {
+  const signOutDevice = async (id: string) => {
     setNotice(null);
+    setProblem(null);
+    try {
+      await revokeSession.mutateAsync(id);
+      setNotice('That device has been signed out.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const downloadData = async () => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      const data = await exportData.mutateAsync();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `glam-connect-data-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice('Your data export has been downloaded.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const removeAccount = async () => {    setNotice(null);
     setProblem(null);
     if (deleteConfirm !== 'DELETE') {
       setProblem('Type DELETE to confirm account deletion.');
@@ -275,9 +309,14 @@ export default function AccountPage() {
       <section className="card p-6 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="font-semibold">Sessions &amp; devices</h2>
-          <button onClick={signOutEverywhere} disabled={revokeAllSessions.isPending} className="chip !py-1 !px-3 text-xs">
-            {revokeAllSessions.isPending ? 'Signing out…' : 'Sign out everywhere'}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={downloadData} disabled={exportData.isPending} className="chip !py-1 !px-3 text-xs">
+              {exportData.isPending ? 'Preparing…' : 'Download my data'}
+            </button>
+            <button onClick={signOutEverywhere} disabled={revokeAllSessions.isPending} className="chip !py-1 !px-3 text-xs">
+              {revokeAllSessions.isPending ? 'Signing out…' : 'Sign out everywhere'}
+            </button>
+          </div>
         </div>
         <div className="space-y-2">
           {(sessions.data?.sessions ?? []).map((session) => (
@@ -287,6 +326,13 @@ export default function AccountPage() {
               <span className="text-xs opacity-60">
                 started {new Date(session.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
               </span>
+              <button
+                onClick={() => signOutDevice(session.id)}
+                disabled={revokeSession.isPending}
+                className="text-xs underline opacity-60"
+              >
+                Sign out
+              </button>
             </div>
           ))}
           {!sessions.data?.sessions.length && <p className="text-sm opacity-60">No active sessions.</p>}

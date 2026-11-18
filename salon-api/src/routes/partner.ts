@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { one, query, withTenant } from '../db.js';
-import { parse, badRequest, notFound, forbidden, conflict } from '../http.js';
+import { parse, badRequest, notFound, forbidden, conflict, AppError } from '../http.js';
 import { authenticate, requireRole, salonIdForUser } from '../auth.js';
+import { rateLimit } from '../redis.js';
 import { encrypt } from '../crypto.js';
 import { dashboard } from '../services/analytics.js';
 import { createInvoice } from '../services/invoices.js';
@@ -868,6 +869,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/partner/payments/:id/refund', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
+    const refundLimit = await rateLimit(`payment:refund:${salonId}`, 10, 600);
+    if (!refundLimit.allowed) {
+      throw new AppError(429, 'RATE_LIMITED', 'Too many refund attempts. Try again in a few minutes.');
+    }
     const { id } = req.params as { id: string };
     const body = parse(
       z.object({

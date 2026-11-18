@@ -478,6 +478,21 @@ async function main() {
   const temp = await login(tempPhone);
   const sessions = await call<any>('/users/me/sessions', { token: temp.access_token });
   ok('session list', `${sessions.sessions.length} active`);
+  const revokedOne = await call<any>(`/users/me/sessions/${sessions.sessions[0].id}/revoke`, {
+    method: 'POST',
+    token: temp.access_token,
+    body: {},
+  });
+  const afterRevoke = await call<any>('/users/me/sessions', { token: temp.access_token });
+  ok(
+    'single session revoke',
+    `${revokedOne.revoked} revoked · ${sessions.sessions.length - afterRevoke.sessions.length} removed`,
+  );
+  const exported = await call<any>('/users/me/export', { token: temp.access_token });
+  ok(
+    'data export',
+    `${exported.profile.full_name} · ${exported.bookings.length} bookings · ${exported.consents.length} consents`,
+  );
   await call('/users/me/consents', {
     method: 'POST',
     token: temp.access_token,
