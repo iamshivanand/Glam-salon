@@ -36,8 +36,11 @@ the code and the sheet fills it in.
 | -------------- | --------------- |
 | Customer       | `+919800000002` |
 | Salon owner    | `+919800000001` |
+| Salon manager  | `+919800000005` |
+| Staff          | `+919800000006` |
 
-The sheet also has one-tap chips for these demo accounts.
+The sheet also has one-tap chips for these demo accounts. Staff sign in to the same Admin tab
+but see only their own shift and assigned bookings.
 
 ## Tabs
 

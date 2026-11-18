@@ -56,6 +56,17 @@ async function login(phone: string) {
   return tokens;
 }
 
+async function denied(label: string, path: string, token: string, method = 'GET', body?: unknown) {
+  try {
+    await call(path, { method, token, body });
+    fail(label, 'request unexpectedly succeeded');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '';
+    if (message.startsWith('403')) ok(label, '403 forbidden');
+    else fail(label, message.slice(0, 70));
+  }
+}
+
 function istDate(offsetDays = 0) {
   return new Date(Date.now() + 5.5 * 3600_000 + offsetDays * 86_400_000).toISOString().slice(0, 10);
 }
@@ -128,6 +139,53 @@ async function main() {
 
   const todayBookings = await call<any>(`/partner/bookings?date=${istDate(0)}`, { token: owner.access_token });
   ok('partner day book', `${todayBookings.bookings.length} bookings today`);
+
+  // Role scoping: managers run the full console, staff get only their own
+  // shift and assigned bookings.
+  const manager = await login('+919800000005');
+  ok('manager OTP login', manager.user.role);
+  const managerDash = await call<any>('/partner/dashboard?period=MONTH', { token: manager.access_token });
+  ok('manager dashboard', `revenue ₹${(managerDash.revenue_paise / 100).toFixed(0)}`);
+
+  const staff = await login('+919800000006');
+  ok('staff OTP login', staff.user.role);
+
+  const staffMe = await call<any>('/partner/me/staff', { token: staff.access_token });
+  ok('staff self-service profile', `${staffMe.staff.display_name} @ ${staffMe.salon.name}`);
+
+  const staffDay = await call<any>(`/partner/me/bookings?date=${istDate(0)}`, { token: staff.access_token });
+  ok('staff own bookings', `${staffDay.bookings.length} assigned today`);
+  if (!staffDay.bookings.length) throw new Error('demo staff user has no assigned booking today');
+
+  // Staff may move a booking they are assigned to.
+  const staffBookingId = '66666666-6666-4666-8666-000000000007';
+  await withIntegration(async (client) => {
+    await client.query(`UPDATE bookings SET status = 'REQUESTED' WHERE id = $1`, [staffBookingId]);
+  });
+  const accepted = await call<any>(`/partner/me/bookings/${staffBookingId}/status`, {
+    method: 'PATCH',
+    token: staff.access_token,
+    body: { status: 'CONFIRMED' },
+  });
+  ok('staff status update', `${accepted.status} · ${accepted.booking_code}`);
+
+  // ...and nothing else in the partner console.
+  await denied('staff blocked from dashboard', '/partner/dashboard', staff.access_token);
+  await denied('staff blocked from CRM', '/partner/crm', staff.access_token);
+  await denied('staff blocked from invoices', '/partner/invoices', staff.access_token);
+  await denied('staff blocked from staff list', '/partner/staff', staff.access_token);
+
+  // A staff member cannot read a booking assigned to someone else.
+  const otherDay = await call<any>(`/partner/bookings?date=${istDate(-12)}`, { token: owner.access_token });
+  const otherBooking = otherDay.bookings.find((b: any) =>
+    b.items.every((i: any) => i.staff_id !== staffMe.staff.id),
+  );
+  if (otherBooking) {
+    await denied('staff blocked from unassigned booking', `/bookings/${otherBooking.id}`, staff.access_token);
+  }
+
+  // Managers keep the console but not owner-only actions.
+  await denied('manager blocked from KYC submit', '/partner/kyc', manager.access_token, 'POST', {});
 
   const crm = await call<any>('/partner/crm', { token: owner.access_token });
   ok('partner CRM (RLS)', `${crm.customers.length} customers`);

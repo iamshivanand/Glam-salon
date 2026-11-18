@@ -43,6 +43,8 @@ const people = [
   [uid(USERS, 2), '+919800000002', 'Priya Sharma', 'priya@example.com', 'CUSTOMER'],
   [uid(USERS, 3), '+919800000003', 'Neha Verma', 'neha@example.com', 'CUSTOMER'],
   [uid(USERS, 4), '+919800000004', 'Kavya Iyer', 'kavya@example.com', 'CUSTOMER'],
+  [uid(USERS, 5), '+919800000005', 'Aisha Khan', 'aisha@glamconnect.dev', 'SALON_MANAGER'],
+  [uid(USERS, 6), '+919800000006', 'Ritika Menon', 'ritika@glamconnect.dev', 'STAFF'],
   [uid(USERS, 9), '+919800000009', 'Platform Admin', 'admin@glamconnect.dev', 'PLATFORM_ADMIN'],
 ] as const;
 
@@ -379,6 +381,16 @@ for (const [salonIdx, s] of salons.entries()) {
   staffIdsBySalon.set(s.id, ids);
 }
 
+// Demo manager and staff logins map onto the first salon's artists so both
+// roles have real schedules and assigned bookings to work with.
+//   Aisha Khan  → SALON_MANAGER (sees the whole console)
+//   Ritika Menon → STAFF (sees only her own shift and bookings)
+{
+  const [firstArtist, secondArtist] = staffIdsBySalon.get(salons[0].id)!;
+  await q(`UPDATE staff_members SET user_id = $2 WHERE id = $1`, [secondArtist, uid(USERS, 5)]);
+  await q(`UPDATE staff_members SET user_id = $2 WHERE id = $1`, [firstArtist, uid(USERS, 6)]);
+}
+
 // ---------------------------------------------------------------- consents
 for (const customer of [uid(USERS, 2), uid(USERS, 3), uid(USERS, 4)]) {
   for (const purpose of ['RETENTION_REMINDER', 'PROMOTIONAL_OFFERS']) {
@@ -651,6 +663,21 @@ await insertBooking({
   services: [{ id: s1[2], name: serviceTemplates[2].name, price: 250000, duration: 60 }],
 });
 
+// Upcoming visit for the demo staff login. Smoke resets this to REQUESTED and
+// drives it through the staff status endpoint, so the seed ships it CONFIRMED.
+await insertBooking({
+  id: uid(BOOKINGS, 7),
+  code: 'GC-2026-0007',
+  key: 'seed-booking-0007',
+  customerId: customer3,
+  salonId: salon1.id,
+  staffId: st1[0],
+  start: istAt(1, '11:00'),
+  status: 'CONFIRMED',
+  createdAt: istAt(0, '09:30'),
+  services: [{ id: s1[0], name: serviceTemplates[0].name, price: 120000, duration: 60 }],
+});
+
 // ---------------------------------------------------------------- reviews
 await q(
   `INSERT INTO reviews
@@ -912,9 +939,11 @@ console.log(`
 Seed complete.
 
 Demo accounts (OTP is returned in the API response in dev):
-  Salon owner   +91 98000 00001  (Ananya Rao)
-  Customer      +91 98000 00002  (Priya Sharma)
-  Customer      +91 98000 00003  (Neha Verma)
+  Salon owner    +91 98000 00001  (Ananya Rao)
+  Salon manager  +91 98000 00005  (Aisha Khan)
+  Staff          +91 98000 00006  (Ritika Menon)
+  Customer       +91 98000 00002  (Priya Sharma)
+  Customer       +91 98000 00003  (Neha Verma)
   Platform admin +91 98000 00009
 
 Salons: ${salons.map((s) => s.name).join(' | ')}

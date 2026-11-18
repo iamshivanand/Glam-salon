@@ -17,11 +17,16 @@ import {
   settlementsForSalon,
 } from '../services/payments.js';
 import { recordAudit } from '../services/audit.js';
+import { updateBookingStatus } from '../services/booking.js';
 import { isValidGstin, isValidIfsc, isValidPan, normalizeCode } from '../validation.js';
 import { fmtLocalDate } from '../services/availability.js';
 
-const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
+// STAFF deliberately sits outside the partner console: they get a narrow
+// self-service surface (their own shift and assigned bookings) instead of
+// access to revenue, CRM, marketing and payment controls.
+const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'PLATFORM_ADMIN'] as const;
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
+const STAFF_ROLES = ['STAFF'] as const;
 
 async function resolveSalonId(req: any): Promise<string> {
   const header = req.headers['x-salon-id'];
@@ -44,6 +49,31 @@ async function resolveSalonId(req: any): Promise<string> {
   const resolved = await salonIdForUser(req.auth.id);
   if (!resolved) throw forbidden('No salon is linked to this account yet');
   return resolved;
+}
+
+async function resolveStaffMembership(req: any): Promise<{
+  id: string;
+  salon_id: string;
+  display_name: string;
+  specialization: string | null;
+}> {
+  const member = await one<{
+    id: string;
+    salon_id: string;
+    display_name: string;
+    specialization: string | null;
+  }>(
+    `SELECT id, salon_id, display_name, specialization
+       FROM staff_members
+      WHERE user_id = $1
+        AND is_active = TRUE
+        AND ($2::uuid IS NULL OR salon_id = $2)
+      ORDER BY created_at
+      LIMIT 1`,
+    [req.auth.id, req.auth.salonId ?? null],
+  );
+  if (!member) throw forbidden('This account is not linked to an active staff record');
+  return member;
 }
 
 function slugify(name: string): string {
@@ -631,6 +661,82 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       await query(`INSERT INTO staff_service_mapping (staff_id, salon_service_id) VALUES ($1,$2)`, [id, serviceId]);
     }
     return { ok: true, mapped: body.service_ids.length };
+  });
+
+  // ---------- Staff self-service ----------
+  // A staff login sees only its own shift, assigned bookings and the status
+  // transitions it is allowed to drive. Revenue, CRM, marketing, billing and
+  // payment controls stay behind PARTNER_ROLES.
+  app.get('/partner/me/staff', { preHandler: [authenticate, requireRole(...STAFF_ROLES)] }, async (req) => {
+    const member = await resolveStaffMembership(req);
+    const salon = await one(
+      `SELECT id, name, slug, address_line, locality, city FROM salons WHERE id = $1`,
+      [member.salon_id],
+    );
+    const schedule = await query(
+      `SELECT day_of_week, override_date, shift_start, shift_end, breaks_json, is_working_day
+         FROM staff_schedules
+        WHERE staff_id = $1
+        ORDER BY override_date NULLS LAST, day_of_week`,
+      [member.id],
+    );
+    return { staff: member, salon, schedule, today: fmtLocalDate(new Date()) };
+  });
+
+  app.get('/partner/me/bookings', { preHandler: [authenticate, requireRole(...STAFF_ROLES)] }, async (req) => {
+    const member = await resolveStaffMembership(req);
+    const q = parse(z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }), req.query);
+    const date = q.date ?? fmtLocalDate(new Date());
+    const bookings = await query(
+      `SELECT b.id, b.booking_code, b.status, b.scheduled_start_at, b.scheduled_end_at,
+              b.total_payable_paise, b.checkin_pin, b.customer_notes,
+              u.full_name AS customer_name,
+              COALESCE(json_agg(json_build_object(
+                'id', bi.id, 'service_name', bi.service_name_snapshot,
+                'start_at', lower(bi.time_range), 'end_at', upper(bi.time_range),
+                'price_paise', bi.unit_price_paise, 'status', bi.status
+              ) ORDER BY bi.time_range) FILTER (WHERE bi.id IS NOT NULL), '[]') AS items
+         FROM bookings b
+         JOIN users u ON u.id = b.customer_id
+         JOIN booking_items bi ON bi.booking_id = b.id AND bi.staff_id = $1
+        WHERE b.scheduled_start_at >= ($2::date::timestamp AT TIME ZONE 'Asia/Kolkata')
+          AND b.scheduled_start_at <  (($2::date + 1)::timestamp AT TIME ZONE 'Asia/Kolkata')
+        GROUP BY b.id, u.full_name
+        ORDER BY b.scheduled_start_at`,
+      [member.id, date],
+    );
+    return { date, bookings };
+  });
+
+  app.patch('/partner/me/bookings/:id/status', { preHandler: [authenticate, requireRole(...STAFF_ROLES)] }, async (req) => {
+    const member = await resolveStaffMembership(req);
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        status: z.enum([
+          'CONFIRMED',
+          'DECLINED',
+          'ARRIVED',
+          'IN_SERVICE',
+          'COMPLETED',
+          'NO_SHOW',
+          'CANCELLED_BY_SALON',
+        ]),
+        checkin_pin: z.string().regex(/^\d{4}$/).optional(),
+      }),
+      req.body,
+    );
+    const assigned = await one(
+      `SELECT 1 FROM booking_items WHERE booking_id = $1 AND staff_id = $2 LIMIT 1`,
+      [id, member.id],
+    );
+    if (!assigned) throw forbidden('This booking is not assigned to you');
+    return updateBookingStatus({
+      bookingId: id,
+      auth: req.auth!,
+      status: body.status,
+      checkinPin: body.checkin_pin,
+    });
   });
 
   app.get('/partner/resources', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {

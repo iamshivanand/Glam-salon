@@ -37,6 +37,8 @@ code and the modal fills it in for you.
 | -------------- | --------------- |
 | Customer       | `+919800000002` |
 | Salon owner    | `+919800000001` |
+| Salon manager  | `+919800000005` |
+| Staff          | `+919800000006` |
 | Platform admin | `+919800000009` |
 
 ## Pages
@@ -60,12 +62,18 @@ code and the modal fills it in for you.
 | `/admin/services`  | Add services, publish/hide, pricing in paise rendered as ₹                    |
 | `/admin/staff`     | Add artists, view working days, apply a Mon–Sat schedule                     |
 | `/admin/resources` | Rooms, chairs and stations that bookable services depend on                  |
+| `/staff`           | Staff-only day view: shift, break, assigned bookings and allowed status transitions |
 | `/platform`        | Platform-admin KYC review queue + document view, salon pause/activate, user role/status controls, payout recording and audit log |
 
 `/admin/*` is guarded by `components/partner-gate.tsx`; a customer session sees a
 "switch account" prompt instead of the console. Owners with more than one salon get a
 switcher in the admin sidebar; the choice is stored as `gc_active_salon` and sent as
 `X-Salon-Id` on every request.
+
+`SALON_MANAGER` gets the same console as the owner minus salon editing, KYC submission and
+refunds. `STAFF` never enters `/admin`: the navbar shows **My schedule**, which calls the
+`/partner/me/*` endpoints and can only read or advance bookings the staff member is
+assigned to.
 
 ## How it fits together
 

@@ -26,6 +26,20 @@ export function PartnerGate({ children }: { children: React.ReactNode }) {
     );
   }
 
+  if (user.role === 'STAFF') {
+    return (
+      <div className="card p-10 mt-8 max-w-xl mx-auto text-center">
+        <h1 className="font-display text-3xl">This is the salon console</h1>
+        <p className="opacity-70 mt-2">
+          Staff accounts use <strong>My schedule</strong> for shifts and the bookings assigned to them.
+        </p>
+        <a href="/staff" className="btn-primary inline-block mt-5">
+          Open my schedule
+        </a>
+      </div>
+    );
+  }
+
   if (!isOwner(user)) {
     return (
       <div className="card p-10 mt-8 max-w-xl mx-auto text-center">

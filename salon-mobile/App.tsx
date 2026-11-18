@@ -41,12 +41,16 @@ import {
   partnerSettlements,
   rupees,
   searchSalons,
+  staffBookings,
+  staffMe,
   todayIST,
   updateBookingStatus,
+  updateStaffBookingStatus,
   type CreatedBooking,
   type MyBooking,
   type PartnerBooking,
   type Slot,
+  type StaffBooking,
 } from './api';
 
 const qc = new QueryClient();
@@ -72,6 +76,8 @@ const statusLabel = (status: string) => status.replace(/_/g, ' ').toLowerCase();
 const DEMO_ACCOUNTS: [string, string][] = [
   ['+919800000002', 'Customer'],
   ['+919800000001', 'Owner'],
+  ['+919800000005', 'Manager'],
+  ['+919800000006', 'Staff'],
 ];
 
 function useSalons() {
@@ -715,6 +721,168 @@ const NEXT_ACTION: Record<string, { label: string; status: string }[]> = {
   ARRIVED: [{ label: 'Start service', status: 'IN_SERVICE' }],
 };
 
+function StaffPanel() {
+  const { logout } = useAuth();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const today = todayIST();
+  const days = nextDays(7);
+  const [date, setDate] = useState(today);
+
+  const me = useQuery({ queryKey: ['staff', 'me'], queryFn: staffMe });
+  const bookings = useQuery({
+    queryKey: ['staff', 'bookings', date],
+    queryFn: () => staffBookings(date),
+    enabled: !!me.data,
+  });
+  const move = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: string }) => updateStaffBookingStatus(id, status),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['staff'] }),
+    onError: (err: any) => toast.show({ description: err?.message ?? 'Update failed', bg: 'red.500' }),
+  });
+
+  const schedule = me.data?.schedule ?? [];
+  const dow = new Date(`${date}T12:00:00+05:30`).getDay();
+  const shift =
+    schedule.find((row) => row.override_date === date) ??
+    schedule.find((row) => !row.override_date && row.day_of_week === dow) ??
+    null;
+  const rows: StaffBooking[] = bookings.data?.bookings ?? [];
+
+  if (me.isLoading) {
+    return (
+      <VStack flex={1} p={5} alignItems="center" justifyContent="center">
+        <Spinner color="gold.500" />
+      </VStack>
+    );
+  }
+
+  if (me.error) {
+    return (
+      <ScrollView>
+        <Box p={6} mt={8} mx={4} bg="white" borderRadius={22}>
+          <Text fontFamily="heading" fontSize="2xl">No staff record linked</Text>
+          <Text color="coolGray.500" mt={2}>
+            Ask the salon owner to link your phone number from the Staff page.
+          </Text>
+          <Button mt={4} variant="outline" onPress={() => void logout()}>
+            Sign out
+          </Button>
+        </Box>
+      </ScrollView>
+    );
+  }
+
+  return (
+    <ScrollView>
+      <VStack p={5} space={4}>
+        <VStack>
+          <Text fontFamily="heading" fontSize="3xl">My day</Text>
+          <Text fontSize="xs" color="coolGray.500">
+            {me.data?.salon.name} · {me.data?.staff.display_name}
+          </Text>
+        </VStack>
+
+        <HStack bg="white" borderRadius={18} p={4} justifyContent="space-between">
+          <VStack>
+            <Text fontSize="xs" color="coolGray.500">Shift</Text>
+            <Text fontFamily="heading" fontSize="2xl">
+              {shift?.is_working_day ? `${shift.shift_start.slice(0, 5)}–${shift.shift_end.slice(0, 5)}` : 'Day off'}
+            </Text>
+            {!!shift?.is_working_day && !!shift?.breaks_json?.length && (
+              <Text fontSize="xs" color="coolGray.500">
+                Break {shift.breaks_json.map((b) => `${b.start}–${b.end}`).join(', ')}
+              </Text>
+            )}
+          </VStack>
+          <VStack alignItems="flex-end">
+            <Text fontSize="xs" color="coolGray.500">Assigned</Text>
+            <Text fontFamily="heading" fontSize="2xl">{rows.length}</Text>
+            <Text fontSize="xs" color="coolGray.500">bookings</Text>
+          </VStack>
+        </HStack>
+
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          <HStack space={2}>
+            {days.map((d) => (
+              <Button
+                key={d}
+                size="sm"
+                variant={d === date ? 'solid' : 'outline'}
+                bg={d === date ? 'plum.500' : undefined}
+                _text={{ color: d === date ? 'white' : undefined }}
+                onPress={() => setDate(d)}
+              >
+                {d === today ? 'Today' : dayLabel(d)}
+              </Button>
+            ))}
+          </HStack>
+        </ScrollView>
+
+        {bookings.isLoading && <Spinner color="gold.500" />}
+        {!bookings.isLoading && rows.length === 0 && (
+          <Text color="coolGray.500" fontSize="sm">Nothing assigned on this date.</Text>
+        )}
+
+        {rows.map((booking) => {
+          const actions = NEXT_ACTION[booking.status] ?? [];
+          return (
+            <Box key={booking.id} bg="white" borderRadius={18} p={4}>
+              <HStack justifyContent="space-between" alignItems="flex-start">
+                <VStack flex={1}>
+                  <Text fontWeight="600">
+                    {istTime(booking.scheduled_start_at)}–{istTime(booking.scheduled_end_at)} · {booking.customer_name}
+                  </Text>
+                  <Text fontSize="xs" color="coolGray.500" mt={0.5}>
+                    {booking.booking_code} · {booking.items.map((i) => i.service_name).join(', ')}
+                  </Text>
+                  {!!booking.customer_notes && (
+                    <Text fontSize="xs" color="coolGray.500" mt={1}>Note: {booking.customer_notes}</Text>
+                  )}
+                </VStack>
+                <Badge colorScheme={STATUS_SCHEME[booking.status] ?? 'coolGray'} borderRadius={8}>
+                  {statusLabel(booking.status)}
+                </Badge>
+              </HStack>
+              {actions.length > 0 && (
+                <HStack space={2} mt={3}>
+                  {actions.map((a, idx) => (
+                    <Button
+                      key={a.status}
+                      size="sm"
+                      bg={idx === 0 ? 'plum.500' : undefined}
+                      variant={idx === 0 ? 'solid' : 'outline'}
+                      isLoading={move.isPending}
+                      onPress={() => move.mutate({ id: booking.id, status: a.status })}
+                    >
+                      {a.label}
+                    </Button>
+                  ))}
+                </HStack>
+              )}
+            </Box>
+          );
+        })}
+
+        <Box bg="white" borderRadius={18} p={4}>
+          <Text fontWeight="600" mb={2}>Weekly schedule</Text>
+          {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((label, day) => {
+            const row = schedule.find((s) => !s.override_date && s.day_of_week === day);
+            return (
+              <HStack key={label} justifyContent="space-between" py={1}>
+                <Text fontSize="sm" color="coolGray.500">{label}</Text>
+                <Text fontSize="sm">
+                  {row?.is_working_day ? `${row.shift_start.slice(0, 5)}–${row.shift_end.slice(0, 5)}` : 'Off'}
+                </Text>
+              </HStack>
+            );
+          })}
+        </Box>
+      </VStack>
+    </ScrollView>
+  );
+}
+
 function Admin() {
   const { user, logout } = useAuth();
   const { openAuth } = useUi();
@@ -792,6 +960,8 @@ function Admin() {
       </ScrollView>
     );
   }
+
+  if (user.role === 'STAFF') return <StaffPanel />;
 
   if (!owner) {
     return (
@@ -1206,7 +1376,7 @@ function Shell() {
           </Text>
           {user && (
             <Text fontSize="xs" color="coolGray.500">
-              {user.full_name}{owner ? ' · owner' : ''}
+              {user.full_name}{owner ? ' · owner' : user.role === 'STAFF' ? ' · staff' : ''}
             </Text>
           )}
         </VStack>
@@ -1239,7 +1409,7 @@ function Shell() {
             _text={{ color: tab === key ? 'white' : undefined }}
             onPress={() => setTab(key)}
           >
-            {label}
+            {key === 'admin' && user?.role === 'STAFF' ? 'My day' : label}
           </Button>
         ))}
       </HStack>

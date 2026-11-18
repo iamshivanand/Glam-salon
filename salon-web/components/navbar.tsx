@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { ThemeToggle } from './theme-toggle';
-import { useAuth, useAuthModal, isOwner } from '@/lib/store';
+import { useAuth, useAuthModal, isOwner, isStaff } from '@/lib/store';
 
 function AuthButton() {
   const { user, hydrated, logout } = useAuth();
@@ -61,6 +61,11 @@ export function Navbar() {
           {user && isOwner(user) && (
             <Link href="/admin" className="hidden sm:inline chip !py-2">
               Dashboard
+            </Link>
+          )}
+          {user && isStaff(user) && (
+            <Link href="/staff" className="hidden sm:inline chip !py-2">
+              My schedule
             </Link>
           )}
           {user?.role === 'PLATFORM_ADMIN' && (

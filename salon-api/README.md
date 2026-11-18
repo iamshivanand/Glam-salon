@@ -78,7 +78,7 @@ Useful scripts:
 | `npm run seed`      | Load the deterministic demo dataset                        |
 | `npm run db:reset`  | Drop the `public` schema (destructive)                     |
 | `npm run dispatch`  | One-shot reminder dispatch (cron-friendly, no HTTP)        |
-| `npm run smoke`     | End-to-end test against a running API (43 checks with Razorpay test keys) |
+| `npm run smoke`     | End-to-end test against a running API (55 checks with Razorpay test keys) |
 
 A clean rebuild:
 
@@ -100,7 +100,10 @@ day book, CRM (through RLS), reminders, reminder delivery with a provider receip
 consent guard, live queue, POS invoice, customer booking list, admin stats, admin audit log,
 upload limits, presign refusal without storage, KYC format validation, refund rejection,
 partner payouts, session listing, consent history, session revocation, account deletion and
-two RBAC denials. With `RAZORPAY_WEBHOOK_SECRET` set it also posts signed capture/refund
+two RBAC denials. It also signs in the demo manager and staff accounts: the manager reaches
+the dashboard but not owner-only actions, while staff read their own shift, advance an
+assigned booking and are denied the dashboard, CRM, invoices, staff list and unassigned
+bookings. With `RAZORPAY_WEBHOOK_SECRET` set it also posts signed capture/refund
 webhooks and checks the refund ledger (this runs in CI with a dummy secret). With test API
 keys it creates a real test-mode Razorpay order, replays the intent key and verifies a
 checkout signature; those three checks are skipped when keys are absent.
@@ -123,10 +126,15 @@ OTP is auto-filled in dev responses.
 | Role          | Phone           | Name           |
 | ------------- | --------------- | -------------- |
 | Salon owner   | `+919800000001` | Ananya Rao     |
+| Salon manager | `+919800000005` | Aisha Khan     |
+| Staff         | `+919800000006` | Ritika Menon   |
 | Customer      | `+919800000002` | Priya Sharma   |
 | Customer      | `+919800000003` | Neha Verma     |
 | Customer      | `+919800000004` | Kavya Iyer     |
 | Platform admin| `+919800000009` | Platform Admin |
+
+The manager login runs the full partner console; the staff login only gets its own shift and
+assigned bookings (see `GET /partner/me/*`).
 
 Seeded staff are **off on Sundays**; availability lookups should scan a few days ahead.
 
@@ -192,6 +200,11 @@ scripts/              migrate, seed, reset, dispatch, smoke
 `/partner/bookings` · `/partner/dashboard` · `/partner/invoices` · `/partner/payments` (+ `/:id/refund`) ·
 `/partner/settlements` · `/partner/payouts` · `/partner/ledger/:customerId` · `/partner/crm` ·
 `/partner/reminders` (+ `/trigger`, `/dispatch`, `/analytics`) · `/partner/queue` · `/partner/reviews`
+
+**Staff self-service** `GET /partner/me/staff` · `GET /partner/me/bookings?date=` ·
+`PATCH /partner/me/bookings/:id/status` — available to `STAFF` only. The partner console
+routes require `SALON_OWNER`, `SALON_MANAGER` or `PLATFORM_ADMIN`; a staff session is
+rejected with 403 even though it resolves to a salon.
 
 **Payments** `GET /payments/capabilities` · `GET /payments` · `POST /payments/intents` ·
 `POST /payments/:id/verify` (all customer-scoped; intents require `Idempotency-Key`)

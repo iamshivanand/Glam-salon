@@ -284,14 +284,27 @@ export async function getBookingForActor(bookingId: string, auth: { id: string; 
   if (!booking) throw notFound('Booking not found');
   if (auth.role === 'PLATFORM_ADMIN') return booking;
   if (booking.customer_id === auth.id) return booking;
-  if (auth.role === 'SALON_OWNER' || auth.role === 'SALON_MANAGER' || auth.role === 'STAFF') {
+  if (auth.role === 'SALON_OWNER' || auth.role === 'SALON_MANAGER') {
     const salon = await one(`SELECT id FROM salons WHERE id = $1 AND owner_id = $2`, [booking.salon_id, auth.id]);
     if (salon) return booking;
     const staff = await one(
-      `SELECT 1 FROM staff_members WHERE salon_id = $1 AND user_id = $2`,
+      `SELECT 1 FROM staff_members WHERE salon_id = $1 AND user_id = $2 AND is_active`,
       [booking.salon_id, auth.id],
     );
     if (staff) return booking;
+  }
+  // Staff may only touch bookings they are actually assigned to, not every
+  // booking in the salon they happen to work at.
+  if (auth.role === 'STAFF') {
+    const assigned = await one(
+      `SELECT 1
+         FROM staff_members sm
+         JOIN booking_items bi ON bi.staff_id = sm.id
+        WHERE sm.user_id = $1 AND sm.is_active AND bi.booking_id = $2
+        LIMIT 1`,
+      [auth.id, bookingId],
+    );
+    if (assigned) return booking;
   }
   throw forbidden('You cannot access this booking');
 }
@@ -369,7 +382,8 @@ export async function rescheduleBooking(opts: {
         ],
       );
 
-      return one(`SELECT * FROM bookings WHERE id = $1`, [opts.bookingId]);
+      const res = await client.query(`SELECT * FROM bookings WHERE id = $1`, [opts.bookingId]);
+      return res.rows[0] ?? null;
     });
 
     if (updated) {
@@ -502,7 +516,8 @@ export async function updateBookingStatus(opts: {
        VALUES ($1,$2,$3,$4,$5,'status_update')`,
       [opts.bookingId, opts.auth.id, opts.auth.role, booking.status, opts.status],
     );
-    return one(`SELECT * FROM bookings WHERE id = $1`, [opts.bookingId]);
+    const res = await client.query(`SELECT * FROM bookings WHERE id = $1`, [opts.bookingId]);
+    return res.rows[0] ?? null;
   });
 
   const template =

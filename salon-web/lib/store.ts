@@ -64,6 +64,8 @@ export const useAuth = create<AuthState>()(
 export const isOwner = (user: SessionUser | null) =>
   !!user && ['SALON_OWNER', 'SALON_MANAGER', 'PLATFORM_ADMIN'].includes(user.role);
 
+export const isStaff = (user: SessionUser | null) => !!user && user.role === 'STAFF';
+
 // ------------------------------------------------------------------ booking draft
 interface BookingState {
   salonId?: string;

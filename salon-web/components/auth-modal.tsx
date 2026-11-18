@@ -7,6 +7,8 @@ import { useAuth, useAuthModal } from '@/lib/store';
 const DEMO = [
   { label: 'Customer', phone: '+919800000002' },
   { label: 'Salon owner', phone: '+919800000001' },
+  { label: 'Manager', phone: '+919800000005' },
+  { label: 'Staff', phone: '+919800000006' },
 ];
 
 export function AuthModal() {

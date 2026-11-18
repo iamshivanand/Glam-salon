@@ -42,7 +42,7 @@ Verify the backend:
 
 ```powershell
 cd salon-api
-npm run smoke          # 40+ end-to-end checks
+npm run smoke          # 55 end-to-end checks
 ```
 
 ## Demo accounts
@@ -52,6 +52,8 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 | Role           | Phone           |
 | -------------- | --------------- |
 | Salon owner    | `+919800000001` |
+| Salon manager  | `+919800000005` |
+| Staff          | `+919800000006` |
 | Customer       | `+919800000002` |
 | Customer       | `+919800000003` |
 | Customer       | `+919800000004` |
