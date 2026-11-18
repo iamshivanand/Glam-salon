@@ -78,7 +78,7 @@ Useful scripts:
 | `npm run seed`      | Load the deterministic demo dataset                        |
 | `npm run db:reset`  | Drop the `public` schema (destructive)                     |
 | `npm run dispatch`  | One-shot reminder dispatch (cron-friendly, no HTTP)        |
-| `npm run smoke`     | 36-check end-to-end test against a running API             |
+| `npm run smoke`     | End-to-end test against a running API (43 checks with Razorpay test keys) |
 
 A clean rebuild:
 
@@ -100,7 +100,10 @@ day book, CRM (through RLS), reminders, reminder delivery with a provider receip
 consent guard, live queue, POS invoice, customer booking list, admin stats, admin audit log,
 upload limits, presign refusal without storage, KYC format validation, refund rejection,
 partner payouts, session listing, consent history, session revocation, account deletion and
-two RBAC denials.
+two RBAC denials. With `RAZORPAY_WEBHOOK_SECRET` set it also posts signed capture/refund
+webhooks and checks the refund ledger (this runs in CI with a dummy secret). With test API
+keys it creates a real test-mode Razorpay order, replays the intent key and verifies a
+checkout signature; those three checks are skipped when keys are absent.
 
 Prove tenant isolation directly:
 
@@ -273,6 +276,13 @@ customer service window. Signature checks use `WHATSAPP_APP_SECRET`; webhook ver
 - `razorpay` creates real orders via the live API, verifies checkout signatures, and handles
   `payment.captured`, `payment.failed` and `refund.processed` webhooks. Refunds call
   `/payments/:id/refund` upstream.
+- Payment tables use `FORCE ROW LEVEL SECURITY`, so every webhook lookup runs under the
+  trusted-integration GUC and every write under the owning salon's tenant transaction.
+  `payment.captured` marks the order paid; `refund.processed`/`refund.failed` update the
+  matching ledger row (by our `refund_id` note, then provider id, otherwise inserted as an
+  external refund) and recompute `REFUNDED` vs `PARTIALLY_REFUNDED` from the cumulative
+  ledger. The same fix covers idempotent intent lookup and checkout verification, which
+  previously returned “not found” under RLS.
 - Refunds go through the `payment_refunds` ledger. The partner route accepts an
   `Idempotency-Key`, reserves the amount inside a transaction, calls the gateway, then marks
   the ledger row and the order together. A retry with the same key returns the original

@@ -2,11 +2,16 @@
  * End-to-end smoke test against a running API.
  *   npx tsx scripts/smoke.ts
  */
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import { withIntegration } from '../src/db.js';
+
 const BASE = process.env.SMOKE_BASE_URL ?? 'http://127.0.0.1:4000';
 const API = `${BASE}/api/v1`;
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 
 function ok(label: string, detail?: unknown) {
   passed += 1;
@@ -264,6 +269,140 @@ async function main() {
   const payouts = await call<any>('/partner/payouts', { token: owner.access_token });
   ok('partner payouts', `${payouts.payouts.length} recorded`);
 
+  // Razorpay webhooks must find orders under FORCE RLS and keep the refund
+  // ledger in sync. Seed an order directly (no gateway needed), then post
+  // signed events exactly as Razorpay would.
+  const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  const webhookOrderId = crypto.randomUUID();
+  const providerOrderId = `order_smoke_${Date.now()}`;
+  const providerPaymentId = `pay_smoke_${Date.now()}`;
+  if (!webhookSecret) {
+    skipped += 1;
+    console.log('  SKIP  razorpay webhook checks — RAZORPAY_WEBHOOK_SECRET is not set');
+  } else {
+    await withIntegration(async (client) => {
+      await client.query(
+        `INSERT INTO payment_orders
+           (id, salon_id, customer_id, provider, provider_order_id, amount_paise, currency, status, idempotency_key)
+         VALUES ($1,$2,$3,'razorpay',$4,100000,'INR','CREATED',$5)`,
+        [webhookOrderId, salonId, customer.user.id, providerOrderId, `smoke-webhook-${Date.now()}`],
+      );
+    });
+
+    const webhook = async (payload: unknown) => {
+      const raw = JSON.stringify(payload);
+      const signature = crypto.createHmac('sha256', webhookSecret).update(raw).digest('hex');
+      const res = await fetch(`${BASE}/webhooks/razorpay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-razorpay-signature': signature },
+        body: raw,
+      });
+      if (!res.ok) throw new Error(`webhook ${res.status}: ${await res.text()}`);
+      return res.json();
+    };
+
+    const orderState = () =>
+      withIntegration(async (client) => {
+        const res = await client.query<{ status: string; provider_payment_id: string | null }>(
+          `SELECT status, provider_payment_id FROM payment_orders WHERE id = $1`,
+          [webhookOrderId],
+        );
+        return res.rows[0];
+      });
+
+    await webhook({
+      event: 'payment.captured',
+      payload: { payment: { entity: { id: providerPaymentId, order_id: providerOrderId } } },
+    });
+    const paid = await orderState();
+    ok('razorpay webhook capture', `${paid.status} · ${paid.provider_payment_id}`);
+
+    await webhook({
+      event: 'refund.processed',
+      payload: { refund: { entity: { id: `rfnd_smoke_${Date.now()}`, payment_id: providerPaymentId, amount: 40000 } } },
+    });
+    const partial = await orderState();
+    ok('razorpay webhook partial refund', partial.status);
+
+    await webhook({
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: { id: `rfnd_smoke_${Date.now()}_b`, payment_id: providerPaymentId, amount: 60000 },
+        },
+      },
+    });
+    const full = await orderState();
+    ok('razorpay webhook full refund', full.status);
+
+    const ledger = await withIntegration(async (client) => {
+      const res = await client.query<{ total: string; rows: string }>(
+        `SELECT COALESCE(SUM(amount_paise), 0)::bigint::text AS total, COUNT(*)::text AS rows
+           FROM payment_refunds
+          WHERE payment_order_id = $1 AND status = 'SUCCEEDED'`,
+        [webhookOrderId],
+      );
+      return res.rows[0];
+    });
+    ok('razorpay refund ledger', `${ledger.rows} rows · ₹${Number(ledger.total) / 100}`);
+
+    await withIntegration(async (client) => {
+      await client.query(`DELETE FROM payment_refunds WHERE payment_order_id = $1`, [webhookOrderId]);
+      await client.query(`DELETE FROM payment_orders WHERE id = $1`, [webhookOrderId]);
+    });
+  }
+
+  // With test keys configured, exercise the real Razorpay API and the
+  // checkout-signature path. No money moves: test mode only.
+  const razorpayReady =
+    health.payments?.provider === 'razorpay' &&
+    Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+  if (!razorpayReady) {
+    skipped += 1;
+    console.log('  SKIP  razorpay order + verify — test keys are not configured');
+  } else {
+    const intentKey = `smoke-rzp-${Date.now()}`;
+    const intent = await call<any>('/payments/intents', {
+      method: 'POST',
+      token: customer.access_token,
+      key: intentKey,
+      body: { booking_id: booking.id, amount_paise: 10000 },
+    });
+    ok('razorpay test order', `${intent.order_id} · ₹${intent.amount_paise / 100}`);
+
+    const replay = await call<any>('/payments/intents', {
+      method: 'POST',
+      token: customer.access_token,
+      key: intentKey,
+      body: { booking_id: booking.id, amount_paise: 10000 },
+    });
+    ok(
+      'razorpay intent idempotency',
+      replay.payment_id === intent.payment_id ? 'same payment' : 'DUPLICATE CREATED',
+    );
+
+    // Razorpay checkout signature is HMAC-SHA256(order_id|payment_id, secret).
+    const syntheticPaymentId = `pay_smoke_${Date.now()}`;
+    const signature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
+      .update(`${intent.order_id}|${syntheticPaymentId}`)
+      .digest('hex');
+    const verified = await call<any>(`/payments/${intent.payment_id}/verify`, {
+      method: 'POST',
+      token: customer.access_token,
+      body: {
+        razorpay_order_id: intent.order_id,
+        razorpay_payment_id: syntheticPaymentId,
+        razorpay_signature: signature,
+      },
+    });
+    ok('razorpay checkout verify', `${verified.status} · verified=${verified.verified}`);
+
+    await withIntegration(async (client) => {
+      await client.query(`DELETE FROM payment_orders WHERE id = $1`, [intent.payment_id]);
+    });
+  }
+
   try {
     await call('/partner/payments/00000000-0000-0000-0000-000000000000/refund', {
       method: 'POST',
@@ -311,7 +450,7 @@ async function main() {
     ok('RBAC blocks customer from partner');
   }
 
-  console.log(`\n${passed} passed, ${failed} failed\n`);
+  console.log(`\n${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}\n`);
   process.exit(failed ? 1 : 0);
 }
 

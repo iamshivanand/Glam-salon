@@ -126,10 +126,16 @@ export async function createPaymentIntent(opts: {
 
   if (amount <= 0) throw badRequest('INVALID_AMOUNT', 'Payment amount must be greater than zero');
 
-  const existing = await one<PaymentOrder>(
-    `SELECT * FROM payment_orders WHERE customer_id = $1 AND idempotency_key = $2`,
-    [opts.customerId, opts.idempotencyKey],
-  );
+  // Payment tables are FORCE RLS, so even a customer-scoped lookup needs the
+  // trusted-integration GUC. Without it, a retried intent looks new and the
+  // unique idempotency index turns the retry into a 409.
+  const existing = await withIntegration(async (client) => {
+    const res = await client.query<PaymentOrder>(
+      `SELECT * FROM payment_orders WHERE customer_id = $1 AND idempotency_key = $2`,
+      [opts.customerId, opts.idempotencyKey],
+    );
+    return res.rows[0] ?? null;
+  });
   if (existing) return intentResponse(existing);
 
   if (provider === 'manual') {
@@ -225,10 +231,15 @@ export async function verifyPayment(opts: {
   razorpayPaymentId?: string;
   razorpaySignature?: string;
 }): Promise<Record<string, unknown>> {
-  const order = await one<PaymentOrder>(
-    `SELECT * FROM payment_orders WHERE id = $1 AND customer_id = $2`,
-    [opts.paymentId, opts.customerId],
-  );
+  // Same RLS rule as the intent lookup: read under the integration GUC, then
+  // write under the salon's tenant context.
+  const order = await withIntegration(async (client) => {
+    const res = await client.query<PaymentOrder>(
+      `SELECT * FROM payment_orders WHERE id = $1 AND customer_id = $2`,
+      [opts.paymentId, opts.customerId],
+    );
+    return res.rows[0] ?? null;
+  });
   if (!order) throw notFound('Payment not found');
   if (order.status === 'PAID') return { ...intentResponse(order), already_paid: true };
 
@@ -656,29 +667,35 @@ export async function applyRazorpayWebhook(rawBody: string, signature: string | 
   const payment = event.payload?.payment?.entity;
   const refund = event.payload?.refund?.entity;
 
+  // Webhooks have no salon context and every payment table is FORCE RLS, so
+  // lookups must run under the trusted-integration GUC. Updates still run
+  // inside the owning salon's tenant transaction.
+  const orderForWebhook = (column: 'provider_order_id' | 'provider_payment_id', value: string) =>
+    withIntegration(async (client) => {
+      const res = await client.query<PaymentOrder>(
+        `SELECT * FROM payment_orders WHERE provider = 'razorpay' AND ${column} = $1`,
+        [value],
+      );
+      return res.rows[0] ?? null;
+    });
+
   if (event.event === 'payment.captured' && payment?.order_id && payment?.id) {
-    const order = await one<PaymentOrder>(
-      `SELECT * FROM payment_orders WHERE provider = 'razorpay' AND provider_order_id = $1`,
-      [payment.order_id],
-    );
+    const order = await orderForWebhook('provider_order_id', payment.order_id);
     if (order && order.status !== 'PAID') {
       await markPaid(order, payment.id, { source: 'webhook', event: event.event });
       incrementMetric('glamconnect_payments_captured_total');
     }
-    return { handled: true, event: event.event };
+    return { handled: Boolean(order), event: event.event };
   }
 
   if ((event.event === 'payment.failed' || event.event === 'payment.authorized') && payment?.order_id) {
-    const order = await one<PaymentOrder>(
-      `SELECT * FROM payment_orders WHERE provider = 'razorpay' AND provider_order_id = $1`,
-      [payment.order_id],
-    );
+    const order = await orderForWebhook('provider_order_id', payment.order_id);
     if (order && event.event === 'payment.failed') {
       await withTenant(order.salon_id, async (client) => {
         await client.query(
           `UPDATE payment_orders
               SET status = 'FAILED', raw_response = raw_response || $2::jsonb
-            WHERE id = $1`, 
+            WHERE id = $1`,
           [order.id, JSON.stringify({ source: 'webhook', event: event.event, payment })],
         );
       });
@@ -687,25 +704,100 @@ export async function applyRazorpayWebhook(rawBody: string, signature: string | 
     return { handled: Boolean(order), event: event.event };
   }
 
-  if (event.event === 'refund.processed' && refund?.payment_id) {
-    const order = await one<PaymentOrder>(
-      `SELECT * FROM payment_orders WHERE provider = 'razorpay' AND provider_payment_id = $1`,
-      [refund.payment_id],
-    );
-    if (order) {
-      const refunded = Number(refund.amount ?? 0);
-      const full = refunded >= Number(order.amount_paise);
-      await withTenant(order.salon_id, async (client) => {
-        await client.query(
-          `UPDATE payment_orders
-              SET status = $2, refunded_at = NOW(), raw_response = raw_response || $3::jsonb
-            WHERE id = $1`,
-          [order.id, full ? 'REFUNDED' : 'PARTIALLY_REFUNDED', JSON.stringify({ source: 'webhook', refund })],
+  if ((event.event === 'refund.processed' || event.event === 'refund.failed') && refund?.payment_id) {
+    const order = await orderForWebhook('provider_payment_id', refund.payment_id);
+    if (!order) return { handled: false, event: event.event };
+
+    const succeeded = event.event === 'refund.processed';
+    const providerRefundId: string | null = refund.id ?? null;
+    const amountPaise = Number(refund.amount ?? 0);
+
+    await withTenant(order.salon_id, async (client) => {
+      // Prefer the ledger row our own refund call created (its id travels in the
+      // gateway notes), then the provider refund id. Anything else is a refund
+      // issued outside the API and gets recorded as an external row.
+      let row: RefundRow | undefined;
+      const ledgerId: string | undefined = refund.notes?.refund_id;
+      if (ledgerId) {
+        const res = await client.query<RefundRow>(
+          `SELECT * FROM payment_refunds WHERE id = $1 AND salon_id = $2`,
+          [ledgerId, order.salon_id],
         );
-      });
-      incrementMetric('glamconnect_payments_refunded_total');
-    }
-    return { handled: Boolean(order), event: event.event };
+        row = res.rows[0];
+      }
+      if (!row && providerRefundId) {
+        const res = await client.query<RefundRow>(
+          `SELECT * FROM payment_refunds WHERE salon_id = $1 AND provider_refund_id = $2`,
+          [order.salon_id, providerRefundId],
+        );
+        row = res.rows[0];
+      }
+
+      if (row) {
+        await client.query(
+          `UPDATE payment_refunds
+              SET status = $2,
+                  provider_refund_id = COALESCE($3, provider_refund_id),
+                  error = $4,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [
+            row.id,
+            succeeded ? 'SUCCEEDED' : 'FAILED',
+            providerRefundId,
+            succeeded ? null : 'Refund failed at the gateway',
+          ],
+        );
+      } else if (amountPaise > 0) {
+        const key = `razorpay:${providerRefundId ?? `${refund.payment_id}:${amountPaise}`}`.slice(0, 64);
+        await client.query(
+          `INSERT INTO payment_refunds
+             (salon_id, payment_order_id, amount_paise, reason, status, provider_refund_id, idempotency_key)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           ON CONFLICT (salon_id, idempotency_key) DO UPDATE SET
+             status = EXCLUDED.status,
+             provider_refund_id = COALESCE(EXCLUDED.provider_refund_id, payment_refunds.provider_refund_id),
+             updated_at = NOW()`,
+          [
+            order.salon_id,
+            order.id,
+            amountPaise,
+            refund.notes?.reason ?? null,
+            succeeded ? 'SUCCEEDED' : 'FAILED',
+            providerRefundId,
+            key,
+          ],
+        );
+      }
+
+      if (!succeeded) return;
+
+      const totalRes = await client.query<{ total: string }>(
+        `SELECT COALESCE(SUM(amount_paise), 0)::bigint AS total
+           FROM payment_refunds
+          WHERE payment_order_id = $1 AND status = 'SUCCEEDED'`,
+        [order.id],
+      );
+      const totalRefunded = Number(totalRes.rows[0]?.total ?? 0);
+      const full = totalRefunded >= Number(order.amount_paise);
+      await client.query(
+        `UPDATE payment_orders
+            SET status = $2,
+                refunded_at = NOW(),
+                raw_response = raw_response || $3::jsonb
+          WHERE id = $1`,
+        [order.id, full ? 'REFUNDED' : 'PARTIALLY_REFUNDED', JSON.stringify({ source: 'webhook', refund })],
+      );
+      if (order.invoice_id) {
+        await client.query(
+          `UPDATE invoices_and_payments SET status = $2 WHERE id = $1 AND salon_id = $3`,
+          [order.invoice_id, full ? 'REFUNDED' : 'PARTIALLY_REFUNDED', order.salon_id],
+        );
+      }
+    });
+
+    if (succeeded) incrementMetric('glamconnect_payments_refunded_total');
+    return { handled: true, event: event.event };
   }
 
   return { handled: false, event: event.event };

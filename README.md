@@ -42,7 +42,7 @@ Verify the backend:
 
 ```powershell
 cd salon-api
-npm run smoke          # 36 end-to-end checks
+npm run smoke          # 40+ end-to-end checks
 ```
 
 ## Demo accounts
@@ -89,11 +89,14 @@ at confirm), idempotent refunds with a ledger and audit trail, manually recorded
 payouts, platform admin salon/user controls with an append-only audit log, customer account
 deletion plus consent history and session management, and Expo push registration on mobile.
 
-Implemented but **not verified** here because no credentials are configured: real Twilio,
-Meta WhatsApp Cloud and Resend delivery, Razorpay payments/refunds, and S3 uploads. Local and
-CI runs use the console notification provider, `PAYMENT_PROVIDER=manual` (records intent
-only) and report storage as unconfigured. Nothing in the UI claims a message or payment was
-delivered when the provider was not configured.
+Implemented but **not fully verified** here: real Twilio, Meta WhatsApp Cloud and Resend
+delivery, Razorpay refund execution, live webhook delivery and S3 uploads. Razorpay
+test-mode order creation, intent idempotency and checkout-signature verification **have**
+been exercised with test keys, and webhook capture/refund handling is verified with locally
+signed payloads. Local and CI runs use the console notification provider and report storage
+as unconfigured; `PAYMENT_PROVIDER` is `manual` by default and `razorpay` only when keys are
+present. Nothing in the UI claims a message or payment was delivered when the provider was
+not configured.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs typechecks, API unit tests and the
 production web build, then migrates, seeds and smoke-tests a PostGIS + Redis stack on every

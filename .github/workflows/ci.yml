@@ -88,6 +88,9 @@ jobs:
       PHONE_PEPPER: ci_phone_pepper
       DEV_RETURN_OTP: 'true'
       CORS_ORIGIN: http://localhost:3000
+      # Dummy secret: CI signs its own webhook payloads to exercise the RLS and
+      # refund-ledger path without Razorpay credentials.
+      RAZORPAY_WEBHOOK_SECRET: ci_razorpay_webhook_secret
     steps:
       - uses: actions/checkout@v4
 
