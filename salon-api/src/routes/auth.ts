@@ -138,7 +138,13 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
 
     return {
       ...tokens,
-      user: { id: user!.id, full_name: user!.full_name, role: user!.role, salon_id: salonId },
+      user: {
+        id: user!.id,
+        full_name: user!.full_name,
+        role: user!.role,
+        salon_id: salonId,
+        phone: challenge.phone,
+      },
     };
   });
 

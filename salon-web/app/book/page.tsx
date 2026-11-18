@@ -7,6 +7,7 @@ import {
   useCreateBooking,
   useCreatePaymentIntent,
   useHold,
+  useMe,
   usePaymentCapabilities,
   useSalon,
   useSalonSearch,
@@ -60,6 +61,7 @@ export default function BookPage() {
   const hold = useHold();
   const create = useCreateBooking();
   const capabilities = usePaymentCapabilities();
+  const me = useMe(!!user);
   const createIntent = useCreatePaymentIntent();
   const verifyPayment = useVerifyPayment();
 
@@ -140,6 +142,7 @@ export default function BookPage() {
     try {
       await loadScript('https://checkout.razorpay.com/v1/checkout.js');
       const checkout = paymentIntent.checkout;
+      const contact = user?.phone?.replace(/^\+?91/, '');
       const rzp = new (window as any).Razorpay({
         key: checkout.key,
         amount: checkout.amount,
@@ -147,6 +150,11 @@ export default function BookPage() {
         order_id: checkout.order_id,
         name: 'Glam Connect',
         description: confirmation?.booking_code,
+        prefill: {
+          ...(user?.full_name ? { name: user.full_name } : {}),
+          ...(contact ? { contact } : {}),
+          ...(me.data?.email ? { email: me.data.email } : {}),
+        },
         handler: async (response: any) => {
           try {
             await verifyPayment.mutateAsync({ paymentId: paymentIntent.payment_id, ...response });
