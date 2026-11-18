@@ -82,9 +82,9 @@ export async function rotateRefresh(rawToken: string, ip?: string): Promise<Issu
 
   // Must match the login route. Without the ordering, a refreshed token could
   // point at a different salon than the one the session originally signed into.
-  const salon = await one(`SELECT id FROM salons WHERE owner_id = $1 ORDER BY created_at LIMIT 1`, [user.id]);
+  const salonId = await salonIdForUser(user.id);
   return issueTokens(
-    { id: user.id, role: user.role as UserRole, salonId: salon?.id ?? null },
+    { id: user.id, role: user.role as UserRole, salonId },
     { familyId: row.token_family_id, deviceFingerprint: row.device_fingerprint ?? undefined, ip },
   );
 }
@@ -111,6 +111,31 @@ export function requireRole(...roles: UserRole[]) {
 }
 
 export async function salonIdForUser(userId: string): Promise<string | null> {
-  const salon = await one(`SELECT id FROM salons WHERE owner_id = $1 ORDER BY created_at LIMIT 1`, [userId]);
+  // Owners come first, then salons where the user is an active staff member.
+  // The same ordering is used at login and refresh so a session never silently
+  // switches salon.
+  const salon = await one(
+    `SELECT id FROM (
+       SELECT id, 0 AS rank, created_at FROM salons WHERE owner_id = $1
+       UNION ALL
+       SELECT sm.salon_id AS id, 1 AS rank, sm.created_at
+         FROM staff_members sm
+        WHERE sm.user_id = $1 AND sm.is_active
+     ) linked
+      ORDER BY rank, created_at
+      LIMIT 1`,
+    [userId],
+  );
   return salon?.id ?? null;
+}
+
+/** Revoke every refresh-token family for a user (suspend, delete, sign out all). */
+export async function revokeAllRefreshForUser(userId: string): Promise<number> {
+  const rows = await query(
+    `UPDATE user_refresh_tokens SET revoked_at = NOW()
+      WHERE user_id = $1 AND revoked_at IS NULL
+      RETURNING id`,
+    [userId],
+  );
+  return rows.length;
 }

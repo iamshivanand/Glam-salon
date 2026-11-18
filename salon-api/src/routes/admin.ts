@@ -1,8 +1,13 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { one, query } from '../db.js';
-import { parse, badRequest, notFound } from '../http.js';
-import { authenticate, requireRole } from '../auth.js';
+import { parse, badRequest, notFound, conflict } from '../http.js';
+import { authenticate, requireRole, revokeAllRefreshForUser } from '../auth.js';
+import { listAudit, recordAudit } from '../services/audit.js';
+import { recordPayout } from '../services/payments.js';
+
+const AccountStatus = z.enum(['ACTIVE', 'SUSPENDED', 'DELETED']);
+const UserRole = z.enum(['CUSTOMER', 'SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN']);
 
 export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', authenticate);
@@ -67,7 +72,157 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     if (!kyc) throw notFound('KYC submission not found');
 
     await query(`UPDATE salons SET verification_status = $2 WHERE id = $1`, [salonId, body.decision]);
+    await recordAudit({
+      actorId: req.auth!.id,
+      actorRole: req.auth!.role,
+      salonId,
+      action: 'kyc.reviewed',
+      entityType: 'salon_kyc_verification',
+      entityId: salonId,
+      metadata: { decision: body.decision, rejection_reason: body.rejection_reason ?? null },
+      ip: req.ip,
+    });
     return { salon_id: salonId, verification_status: body.decision };
+  });
+
+  app.patch('/admin/salons/:id/status', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        is_active: z.boolean(),
+        reason: z.string().max(500).optional(),
+      }),
+      req.body,
+    );
+    const row = await one(
+      `UPDATE salons SET is_active = $2 WHERE id = $1
+       RETURNING id, name, is_active, verification_status`,
+      [id, body.is_active],
+    );
+    if (!row) throw notFound('Salon not found');
+    await recordAudit({
+      actorId: req.auth!.id,
+      actorRole: req.auth!.role,
+      salonId: id,
+      action: body.is_active ? 'salon.activated' : 'salon.deactivated',
+      entityType: 'salon',
+      entityId: id,
+      metadata: { reason: body.reason ?? null },
+      ip: req.ip,
+    });
+    return row;
+  });
+
+  app.patch('/admin/users/:id', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        status: AccountStatus.optional(),
+        role: UserRole.optional(),
+        reason: z.string().max(500).optional(),
+      }),
+      req.body,
+    );
+    if (!body.status && !body.role) throw badRequest('VALIDATION_ERROR', 'Set status or role');
+    if (id === req.auth!.id) {
+      throw badRequest('SELF_MODIFICATION', 'You cannot change your own role or status');
+    }
+
+    const before = await one<{ id: string; role: string; status: string }>(
+      `SELECT id, role, status FROM users WHERE id = $1`,
+      [id],
+    );
+    if (!before) throw notFound('User not found');
+
+    if (body.role === 'PLATFORM_ADMIN' || before.role === 'PLATFORM_ADMIN') {
+      const admins = await one<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM users
+          WHERE role = 'PLATFORM_ADMIN' AND status = 'ACTIVE'`,
+      );
+      if (before.role === 'PLATFORM_ADMIN' && Number(admins?.count ?? 0) <= 1) {
+        throw conflict('LAST_ADMIN', 'At least one active platform admin must remain');
+      }
+    }
+
+    const updated = await one(
+      `UPDATE users
+          SET role = COALESCE($2, role),
+              status = COALESCE($3, status),
+              deleted_at = CASE
+                WHEN $3 = 'DELETED' THEN COALESCE(deleted_at, NOW())
+                WHEN $3 = 'ACTIVE' THEN NULL
+                ELSE deleted_at
+              END
+        WHERE id = $1
+        RETURNING id, full_name, email, role, status, deleted_at`,
+      [id, body.role ?? null, body.status ?? null],
+    );
+
+    if (body.status && body.status !== 'ACTIVE') {
+      await revokeAllRefreshForUser(id);
+    }
+    await recordAudit({
+      actorId: req.auth!.id,
+      actorRole: req.auth!.role,
+      action: 'user.updated',
+      entityType: 'user',
+      entityId: id,
+      metadata: {
+        before: { role: before.role, status: before.status },
+        after: { role: updated?.role, status: updated?.status },
+        reason: body.reason ?? null,
+      },
+      ip: req.ip,
+    });
+    return updated;
+  });
+
+  app.post('/admin/salons/:id/payouts', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        period_start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        period_end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        amount_paise: z.number().int().positive(),
+        reference: z.string().max(128).optional(),
+        notes: z.string().max(500).optional(),
+      }),
+      req.body,
+    );
+    if (body.period_end < body.period_start) {
+      throw badRequest('VALIDATION_ERROR', 'period_end must be on or after period_start');
+    }
+    const salon = await one(`SELECT id FROM salons WHERE id = $1`, [id]);
+    if (!salon) throw notFound('Salon not found');
+    return recordPayout({
+      salonId: id,
+      periodStart: body.period_start,
+      periodEnd: body.period_end,
+      amountPaise: body.amount_paise,
+      reference: body.reference,
+      notes: body.notes,
+      recordedBy: req.auth!.id,
+      actorRole: req.auth!.role,
+      ip: req.ip,
+    });
+  });
+
+  app.get('/admin/audit', async (req) => {
+    const q = parse(
+      z.object({
+        limit: z.coerce.number().int().min(1).max(200).optional(),
+        action: z.string().max(64).optional(),
+        salon_id: z.string().uuid().optional(),
+      }),
+      req.query,
+    );
+    return {
+      events: await listAudit({
+        limit: q.limit ?? 100,
+        action: q.action,
+        salonId: q.salon_id,
+      }),
+    };
   });
 
   app.patch('/admin/salons/:id/commission', async (req) => {
@@ -99,6 +254,21 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
         body.saas_monthly_fee_paise ?? null,
       ],
     );
+    await recordAudit({
+      actorId: req.auth!.id,
+      actorRole: req.auth!.role,
+      salonId: id,
+      action: 'commission.updated',
+      entityType: 'salon_commission_config',
+      entityId: id,
+      metadata: {
+        plan_tier: body.plan_tier ?? null,
+        marketplace_new_client_bps: body.marketplace_new_client_bps ?? null,
+        repeat_crm_client_bps: body.repeat_crm_client_bps ?? null,
+        saas_monthly_fee_paise: body.saas_monthly_fee_paise ?? null,
+      },
+      ip: req.ip,
+    });
     return row;
   });
 

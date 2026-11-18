@@ -45,6 +45,25 @@ export async function buildApp() {
   });
   await app.register(cookie);
 
+  // One JSON parser for the whole app:
+  //  - keep the raw body so provider webhooks can verify HMACs byte-for-byte,
+  //  - treat an empty body as `{}` because DELETE requests often send
+  //    `Content-Type: application/json` without payload.
+  app.addContentTypeParser(
+    ['application/json', 'application/*+json'],
+    { parseAs: 'string' },
+    (req, body, done) => {
+      (req as any).rawBody = body;
+      const raw = typeof body === 'string' ? body.trim() : '';
+      if (!raw) return done(null, {});
+      try {
+        done(null, JSON.parse(raw));
+      } catch (err) {
+        done(err as Error, undefined);
+      }
+    },
+  );
+
   app.setErrorHandler((err: any, req, reply) => {
     if (err instanceof AppError) {
       return reply.status(err.statusCode).send({
@@ -69,6 +88,12 @@ export async function buildApp() {
     if (err?.code === '23503') {
       return reply.status(400).send({
         error: { code: 'INVALID_REFERENCE', message: 'A referenced record does not exist.' },
+      });
+    }
+    // Fastify's own parser/validation errors are client errors, not 500s.
+    if (typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 500) {
+      return reply.status(err.statusCode).send({
+        error: { code: err.code ?? 'BAD_REQUEST', message: err.message },
       });
     }
     req.log.error({ err }, 'unhandled error');

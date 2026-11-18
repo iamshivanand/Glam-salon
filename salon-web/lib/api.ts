@@ -792,8 +792,30 @@ export function useRefundPayment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, amount_paise, reason }: { id: string; amount_paise?: number; reason?: string }) =>
-      api(`/partner/payments/${id}/refund`, { method: 'POST', body: { amount_paise, reason } }),
+      api(`/partner/payments/${id}/refund`, {
+        method: 'POST',
+        body: { amount_paise, reason },
+        key: crypto.randomUUID(),
+      }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['partner'] }),
+  });
+}
+
+export interface Payout {
+  id: string;
+  period_start: string;
+  period_end: string;
+  amount_paise: number;
+  reference: string | null;
+  notes: string | null;
+  created_at: string;
+}
+
+export function usePartnerPayouts(enabled = true) {
+  return useQuery({
+    queryKey: ['partner', 'payouts'],
+    queryFn: () => api<{ payouts: Payout[] }>('/partner/payouts'),
+    enabled,
   });
 }
 
@@ -812,6 +834,7 @@ export function usePartnerSettlements(from?: string, to?: string, enabled = true
 
 // ------------------------------------------------------------------ uploads
 export interface PresignResult {
+  upload_id: string;
   upload_url: string;
   method: 'PUT';
   key: string;
@@ -820,16 +843,27 @@ export interface PresignResult {
   headers: Record<string, string>;
   content_type: string;
   purpose: string;
+  status: 'PRESIGNED' | 'UPLOADED';
+  size_bytes: number | null;
+  confirmed_at: string | null;
 }
 
 export function usePresignUpload() {
   return useMutation({
-    mutationFn: (body: { purpose: 'avatar' | 'kyc_document' | 'style_photo'; content_type: string; salon_id?: string }) =>
-      api<PresignResult>('/uploads/presign', { method: 'POST', body }),
+    mutationFn: (body: {
+      purpose: 'avatar' | 'kyc_document' | 'style_photo';
+      content_type: string;
+      size_bytes: number;
+      salon_id?: string;
+    }) => api<PresignResult>('/uploads/presign', { method: 'POST', body }),
   });
 }
 
-/** Presign, PUT the bytes straight to object storage, then return the stored key. */
+/**
+ * Presign, PUT the bytes straight to object storage, then confirm the object.
+ * The confirm step is what makes the key usable: the API HEADs the object and
+ * checks its real content type and size.
+ */
 export async function uploadFile(
   file: File,
   purpose: 'avatar' | 'kyc_document' | 'style_photo',
@@ -838,7 +872,7 @@ export async function uploadFile(
   const contentType = file.type || 'application/octet-stream';
   const presigned = await api<PresignResult>('/uploads/presign', {
     method: 'POST',
-    body: { purpose, content_type: contentType, salon_id: salonId },
+    body: { purpose, content_type: contentType, size_bytes: file.size, salon_id: salonId },
   });
   const res = await fetch(presigned.upload_url, {
     method: presigned.method,
@@ -846,14 +880,26 @@ export async function uploadFile(
     body: file,
   });
   if (!res.ok) throw new ApiError(res.status, 'UPLOAD_FAILED', `Storage rejected the upload (${res.status})`);
-  return presigned;
+
+  const confirmed = await api<PresignResult>('/uploads/confirm', {
+    method: 'POST',
+    body: { upload_id: presigned.upload_id },
+  });
+  return { ...presigned, ...confirmed };
 }
 
 export function useUploadStatus() {
   return useQuery({
     queryKey: ['uploads', 'status'],
     queryFn: () =>
-      api<{ provider: string; configured: boolean; allowed_content_types: string[]; note: string }>('/uploads/status'),
+      api<{
+        provider: string;
+        configured: boolean;
+        allowed_content_types: string[];
+        max_image_bytes: number;
+        max_pdf_bytes: number;
+        note: string;
+      }>('/uploads/status'),
     staleTime: 5 * 60_000,
   });
 }
@@ -908,7 +954,60 @@ export function useSetConsent() {
   return useMutation({
     mutationFn: (body: { channel: Consent['channel']; purpose: Consent['purpose']; is_granted: boolean; salon_id?: string }) =>
       api('/users/me/consents', { method: 'POST', body }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'consents'] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['me', 'consents'] });
+      void qc.invalidateQueries({ queryKey: ['me', 'consent-history'] });
+    },
+  });
+}
+
+export interface ConsentEvent {
+  id: string;
+  salon_id: string | null;
+  channel: Consent['channel'];
+  purpose: Consent['purpose'];
+  is_granted: boolean;
+  source: string;
+  created_at: string;
+}
+
+export function useConsentHistory(enabled = true) {
+  return useQuery({
+    queryKey: ['me', 'consent-history'],
+    queryFn: () => api<{ events: ConsentEvent[] }>('/users/me/consents/history?limit=50'),
+    enabled,
+  });
+}
+
+export interface Session {
+  id: string;
+  device_fingerprint: string | null;
+  ip_address: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+export function useSessions(enabled = true) {
+  return useQuery({
+    queryKey: ['me', 'sessions'],
+    queryFn: () => api<{ sessions: Session[] }>('/users/me/sessions'),
+    enabled,
+  });
+}
+
+export function useRevokeAllSessions() {
+  return useMutation({
+    mutationFn: () => api<{ revoked: number }>('/users/me/sessions/revoke-all', { method: 'POST', body: {} }),
+  });
+}
+
+export function useDeleteAccount() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api<{ ok: boolean }>('/users/me', { method: 'DELETE' }),
+    onSuccess: () => {
+      qc.clear();
+    },
   });
 }
 
@@ -1084,4 +1183,74 @@ export function useUpdateCommission() {
       api(`/admin/salons/${salonId}/commission`, { method: 'PATCH', body }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin'] }),
   });
+}
+
+export function useSetSalonStatus() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ salonId, is_active, reason }: { salonId: string; is_active: boolean; reason?: string }) =>
+      api(`/admin/salons/${salonId}/status`, { method: 'PATCH', body: { is_active, reason } }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['admin'] });
+      void qc.invalidateQueries({ queryKey: ['partner'] });
+    },
+  });
+}
+
+export function useUpdateAdminUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      userId,
+      ...body
+    }: { userId: string; status?: 'ACTIVE' | 'SUSPENDED' | 'DELETED'; role?: string; reason?: string }) =>
+      api(`/admin/users/${userId}`, { method: 'PATCH', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin'] }),
+  });
+}
+
+export function useRecordPayout() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      salonId,
+      ...body
+    }: {
+      salonId: string;
+      period_start: string;
+      period_end: string;
+      amount_paise: number;
+      reference?: string;
+      notes?: string;
+    }) => api(`/admin/salons/${salonId}/payouts`, { method: 'POST', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin'] }),
+  });
+}
+
+export interface AuditEvent {
+  id: string;
+  actor_id: string | null;
+  actor_role: string | null;
+  actor_name: string | null;
+  salon_id: string | null;
+  salon_name: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export function useAdminAudit(enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'audit'],
+    queryFn: () => api<{ events: AuditEvent[] }>('/admin/audit?limit=50'),
+    enabled,
+  });
+}
+
+/** Short-lived signed URL for a KYC document; the key itself stays server-side. */
+export async function fetchKycDocumentUrl(salonId: string): Promise<string> {
+  const res = await api<{ url: string; expires_in: number }>(`/admin/kyc/${salonId}/document`);
+  return res.url;
 }

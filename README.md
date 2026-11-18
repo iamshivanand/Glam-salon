@@ -42,7 +42,7 @@ Verify the backend:
 
 ```powershell
 cd salon-api
-npm run smoke          # 26 end-to-end checks
+npm run smoke          # 36 end-to-end checks
 ```
 
 ## Demo accounts
@@ -64,6 +64,8 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 - Booking creation and invoicing require an `Idempotency-Key`.
 - The API connects as the least-privilege `glam_app` role; CRM and reminder tables are
   protected by `FORCE ROW LEVEL SECURITY` and a per-request `app.current_salon_id` GUC.
+- Refund and payout records are tenant-isolated the same way, and refunds are idempotent on
+  `Idempotency-Key`.
 - All routes are versioned under `/api/v1` and errors use `{ error: { code, message } }`.
 - Notifications go through one provider layer. `NOTIFICATION_PROVIDER=auto` wires Twilio
   SMS/WhatsApp, Meta WhatsApp Cloud, Resend email and/or a generic webhook from credentials
@@ -81,6 +83,12 @@ replies, multi-salon switching, customer account settings, owner onboarding/KYC,
 admin KYC/commission console, transactional booking/queue/invoice messages, and partner
 settlements. The web app and the Expo app both run against the live API.
 
+The hardening pass adds: validated PAN/GSTIN/IFSC with correct KYC resubmission state, a
+registry-backed two-step upload flow (declared type/size signed into the URL, HEAD verification
+at confirm), idempotent refunds with a ledger and audit trail, manually recorded settlement
+payouts, platform admin salon/user controls with an append-only audit log, customer account
+deletion plus consent history and session management, and Expo push registration on mobile.
+
 Implemented but **not verified** here because no credentials are configured: real Twilio,
 Meta WhatsApp Cloud and Resend delivery, Razorpay payments/refunds, and S3 uploads. Local and
 CI runs use the console notification provider, `PAYMENT_PROVIDER=manual` (records intent
@@ -92,8 +100,9 @@ production web build, then migrates, seeds and smoke-tests a PostGIS + Redis sta
 push. `.github/workflows/release.yml` builds and pushes API/web images to GHCR on a `v*` tag.
 
 Still not implemented: OpenSearch, BullMQ/n8n workers, a durable reminder queue (dispatch is
-an in-process interval or `npm run dispatch`), and an in-app push prompt on mobile
-(`expo-notifications` is not installed; the API side resolves registered Expo tokens).
+an in-process interval or `npm run dispatch`), and real vendor delivery/payment/storage
+execution without credentials. The mobile app now requests push permission after login and
+registers an Expo token, but it has not been exercised on a physical device or emulator here.
 
 See `salon-api/README.md`, `salon-web/README.md` and `ops/README.md` for details.
 

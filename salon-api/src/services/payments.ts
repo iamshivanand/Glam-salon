@@ -2,6 +2,8 @@ import { one, query, withIntegration, withTenant } from '../db.js';
 import { env } from '../env.js';
 import { badRequest, conflict, notFound } from '../http.js';
 import { incrementMetric } from '../metrics.js';
+import { uuid } from '../crypto.js';
+import { recordAudit } from './audit.js';
 import { verifyRazorpayPaymentSignature, verifyRazorpayWebhook } from './signatures.js';
 
 export interface PaymentOrder {
@@ -300,39 +302,167 @@ export async function listPaymentsForSalon(salonId: string, limit = 100): Promis
   });
 }
 
+interface RefundRow {
+  id: string;
+  salon_id: string;
+  payment_order_id: string;
+  amount_paise: number;
+  reason: string | null;
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED';
+  provider_refund_id: string | null;
+  idempotency_key: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Refund a captured payment.
+ *
+ * Money movement and bookkeeping are deliberately split:
+ *   1. claim the Idempotency-Key and reserve the amount in `payment_refunds`,
+ *   2. call the gateway outside the transaction,
+ *   3. finalise the order and the refund row together.
+ * A retried request returns the recorded outcome instead of refunding twice.
+ */
 export async function refundPayment(opts: {
   salonId: string;
   paymentId: string;
   amountPaise?: number;
   reason?: string;
   actorId: string;
+  actorRole?: string;
+  idempotencyKey?: string;
+  ip?: string;
 }): Promise<Record<string, unknown>> {
-  const order = await withTenant(opts.salonId, async (client) => {
-    const res = await client.query<PaymentOrder>(
+  const key = (opts.idempotencyKey ?? uuid()).slice(0, 64);
+
+  const claim = await withTenant(opts.salonId, async (client) => {
+    const orderRes = await client.query<PaymentOrder>(
       `SELECT * FROM payment_orders WHERE id = $1 AND salon_id = $2 FOR UPDATE`,
       [opts.paymentId, opts.salonId],
     );
-    return res.rows[0];
-  });
-  if (!order) throw notFound('Payment not found');
-  if (order.status !== 'PAID') throw conflict('PAYMENT_NOT_REFUNDABLE', `Cannot refund a ${order.status} payment`);
+    const order = orderRes.rows[0];
+    if (!order) throw notFound('Payment not found');
 
-  const amount = Math.min(opts.amountPaise ?? Number(order.amount_paise), Number(order.amount_paise));
-  if (amount <= 0) throw badRequest('INVALID_AMOUNT', 'Refund amount must be greater than zero');
-
-  let providerRefundId: string | null = null;
-  if (order.provider === 'razorpay') {
-    if (!order.provider_payment_id) throw conflict('PAYMENT_NOT_REFUNDABLE', 'No Razorpay payment id on file');
-    const refund = await razorpayRequest<{ id: string; status: string }>(
-      `/payments/${order.provider_payment_id}/refund`,
-      'POST',
-      { amount, notes: { reason: opts.reason ?? '', actor_id: opts.actorId }, speed: 'normal' },
+    const existingRes = await client.query<RefundRow>(
+      `SELECT * FROM payment_refunds WHERE salon_id = $1 AND idempotency_key = $2`,
+      [opts.salonId, key],
     );
-    providerRefundId = refund.id;
+    const existing = existingRes.rows[0];
+    if (existing) return { order, refund: existing, amount: Number(existing.amount_paise), replayed: true };
+
+    if (!['PAID', 'PARTIALLY_REFUNDED'].includes(order.status)) {
+      throw conflict('PAYMENT_NOT_REFUNDABLE', `Cannot refund a ${order.status} payment`);
+    }
+
+    const refundedRes = await client.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount_paise), 0)::bigint AS total
+         FROM payment_refunds
+        WHERE payment_order_id = $1 AND status IN ('PENDING', 'SUCCEEDED')`,
+      [order.id],
+    );
+    const alreadyRefunded = Number(refundedRes.rows[0]?.total ?? 0);
+    const remaining = Number(order.amount_paise) - alreadyRefunded;
+    if (remaining <= 0) throw conflict('PAYMENT_FULLY_REFUNDED', 'This payment has already been refunded');
+
+    const amount = Math.min(opts.amountPaise ?? remaining, remaining);
+    if (amount <= 0) throw badRequest('INVALID_AMOUNT', 'Refund amount must be greater than zero');
+
+    const inserted = await client.query<RefundRow>(
+      `INSERT INTO payment_refunds
+         (salon_id, payment_order_id, amount_paise, reason, status, idempotency_key, requested_by)
+       VALUES ($1,$2,$3,$4,'PENDING',$5,$6)
+       RETURNING *`,
+      [opts.salonId, order.id, amount, opts.reason ?? null, key, opts.actorId],
+    );
+    return {
+      order,
+      refund: inserted.rows[0],
+      amount,
+      alreadyRefunded,
+      replayed: false,
+    };
+  });
+
+  let refund = claim.refund;
+
+  if (refund.status === 'SUCCEEDED') {
+    return {
+      payment_id: claim.order.id,
+      status: claim.order.status,
+      refunded_paise: Number(refund.amount_paise),
+      provider_refund_id: refund.provider_refund_id,
+      refund_id: refund.id,
+      simulated: claim.order.provider === 'manual',
+      replayed: true,
+    };
   }
 
-  const full = amount >= Number(order.amount_paise);
+  // A replayed key whose refund is still PENDING means the outcome is unknown
+  // (the process may have died mid-call). Retrying could move money twice, so
+  // ask the operator to reconcile instead.
+  if (refund.status === 'PENDING' && claim.replayed) {
+    throw conflict('REFUND_IN_PROGRESS', 'A refund with this Idempotency-Key is already in progress');
+  }
+
+  if (refund.status === 'FAILED') {
+    const retried = await withTenant(opts.salonId, async (client) => {
+      const res = await client.query<RefundRow>(
+        `UPDATE payment_refunds SET status = 'PENDING', error = NULL, updated_at = NOW()
+          WHERE id = $1 RETURNING *`,
+        [refund.id],
+      );
+      return res.rows[0];
+    });
+    refund = retried;
+  }
+
+  let providerRefundId: string | null = null;
+  try {
+    if (claim.order.provider === 'razorpay') {
+      if (!claim.order.provider_payment_id) {
+        throw conflict('PAYMENT_NOT_REFUNDABLE', 'No Razorpay payment id on file');
+      }
+      const response = await razorpayRequest<{ id: string; status: string }>(
+        `/payments/${claim.order.provider_payment_id}/refund`,
+        'POST',
+        {
+          amount: claim.amount,
+          notes: { reason: opts.reason ?? '', actor_id: opts.actorId, refund_id: refund.id },
+          speed: 'normal',
+        },
+      );
+      providerRefundId = response.id;
+    }
+  } catch (err) {
+    await withTenant(opts.salonId, async (client) => {
+      await client.query(
+        `UPDATE payment_refunds SET status = 'FAILED', error = $2, updated_at = NOW() WHERE id = $1`,
+        [refund.id, (err instanceof Error ? err.message : String(err)).slice(0, 500)],
+      );
+    }).catch(() => undefined);
+    incrementMetric('glamconnect_payments_refund_failed_total');
+    throw err;
+  }
+
+  // Decide REFUNDED vs PARTIALLY_REFUNDED from the ledger, not just this call,
+  // so a sequence of partial refunds closes the order correctly.
   const updated = await withTenant(opts.salonId, async (client) => {
+    await client.query(
+      `UPDATE payment_refunds
+          SET status = 'SUCCEEDED', provider_refund_id = $2, updated_at = NOW()
+        WHERE id = $1`,
+      [refund.id, providerRefundId],
+    );
+    const totalRes = await client.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount_paise), 0)::bigint AS total
+         FROM payment_refunds
+        WHERE payment_order_id = $1 AND status = 'SUCCEEDED'`,
+      [claim.order.id],
+    );
+    const totalRefunded = Number(totalRes.rows[0]?.total ?? 0);
+    const full = totalRefunded >= Number(claim.order.amount_paise);
+
     const res = await client.query<PaymentOrder>(
       `UPDATE payment_orders
           SET status = $2,
@@ -341,30 +471,131 @@ export async function refundPayment(opts: {
         WHERE id = $1
         RETURNING *`,
       [
-        order.id,
+        claim.order.id,
         full ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
-        JSON.stringify({ refund: { amount_paise: amount, provider_refund_id: providerRefundId, reason: opts.reason ?? null } }),
+        JSON.stringify({
+          refund: {
+            refund_id: refund.id,
+            amount_paise: claim.amount,
+            provider_refund_id: providerRefundId,
+            reason: opts.reason ?? null,
+          },
+        }),
       ],
     );
-    if (order.invoice_id) {
+    if (claim.order.invoice_id) {
       await client.query(
         `UPDATE invoices_and_payments
             SET status = $2
           WHERE id = $1 AND salon_id = $3`,
-        [order.invoice_id, full ? 'REFUNDED' : 'PARTIALLY_REFUNDED', order.salon_id],
+        [claim.order.invoice_id, full ? 'REFUNDED' : 'PARTIALLY_REFUNDED', claim.order.salon_id],
       );
     }
     return res.rows[0];
+  });
+
+  await recordAudit({
+    actorId: opts.actorId,
+    actorRole: opts.actorRole ?? null,
+    salonId: opts.salonId,
+    action: 'payment.refunded',
+    entityType: 'payment_order',
+    entityId: claim.order.id,
+    metadata: {
+      refund_id: refund.id,
+      amount_paise: claim.amount,
+      provider_refund_id: providerRefundId,
+      simulated: claim.order.provider === 'manual',
+    },
+    ip: opts.ip,
   });
 
   incrementMetric('glamconnect_payments_refunded_total');
   return {
     payment_id: updated.id,
     status: updated.status,
-    refunded_paise: amount,
+    refunded_paise: claim.amount,
     provider_refund_id: providerRefundId,
-    simulated: order.provider === 'manual',
+    refund_id: refund.id,
+    simulated: claim.order.provider === 'manual',
+    replayed: false,
   };
+}
+
+export interface SettlementPayoutRow {
+  id: string;
+  salon_id: string;
+  period_start: string;
+  period_end: string;
+  amount_paise: number;
+  reference: string | null;
+  notes: string | null;
+  recorded_by: string | null;
+  created_at: string;
+}
+
+export async function payoutsForSalon(salonId: string, limit = 24): Promise<SettlementPayoutRow[]> {
+  return withTenant(salonId, async (client) => {
+    const res = await client.query<SettlementPayoutRow>(
+      `SELECT * FROM settlement_payouts WHERE salon_id = $1 ORDER BY period_end DESC LIMIT $2`,
+      [salonId, Math.min(Math.max(limit, 1), 100)],
+    );
+    return res.rows;
+  });
+}
+
+export async function recordPayout(opts: {
+  salonId: string;
+  periodStart: string;
+  periodEnd: string;
+  amountPaise: number;
+  reference?: string;
+  notes?: string;
+  recordedBy: string;
+  actorRole?: string;
+  ip?: string;
+}): Promise<SettlementPayoutRow> {
+  const row = await withTenant(opts.salonId, async (client) => {
+    const res = await client.query<SettlementPayoutRow>(
+      `INSERT INTO settlement_payouts
+         (salon_id, period_start, period_end, amount_paise, reference, notes, recorded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (salon_id, period_start, period_end) DO UPDATE SET
+         amount_paise = EXCLUDED.amount_paise,
+         reference = EXCLUDED.reference,
+         notes = EXCLUDED.notes,
+         recorded_by = EXCLUDED.recorded_by
+       RETURNING *`,
+      [
+        opts.salonId,
+        opts.periodStart,
+        opts.periodEnd,
+        opts.amountPaise,
+        opts.reference ?? null,
+        opts.notes ?? null,
+        opts.recordedBy,
+      ],
+    );
+    return res.rows[0];
+  });
+
+  await recordAudit({
+    actorId: opts.recordedBy,
+    actorRole: opts.actorRole ?? null,
+    salonId: opts.salonId,
+    action: 'settlement.payout_recorded',
+    entityType: 'settlement_payout',
+    entityId: row.id,
+    metadata: {
+      period_start: opts.periodStart,
+      period_end: opts.periodEnd,
+      amount_paise: opts.amountPaise,
+      reference: opts.reference ?? null,
+    },
+    ip: opts.ip,
+  });
+
+  return row;
 }
 
 export async function settlementsForSalon(

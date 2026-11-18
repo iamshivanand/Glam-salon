@@ -47,8 +47,8 @@ code and the modal fills it in for you.
 | `/services`        | Full catalogue for the selected salon, grouped by category, add to booking    |
 | `/book`            | 3-step flow: services → artist/date/time → pay mode → confirm (OTP gate + 5-min hold); `?salon=<id>&ref=<token>` deep links select the salon and credit the reminder |
 | `/appointments`    | Customer booking history, statuses, cancel, check-in PIN, post-visit reviews  |
-| `/account`         | Profile, avatar upload, communication consents, saved addresses, payment history |
-| `/onboarding`      | Owner salon creation, store details, licence upload, KYC submission          |
+| `/account`         | Profile, avatar upload, consent history, saved addresses, sessions, payment history and account deletion |
+| `/onboarding`      | Owner salon creation, store details, validated licence upload, KYC submission |
 | `/admin`           | Partner overview: revenue, retention, reminder conversion, live queue, day book |
 | `/admin/calendar`  | Day view bucketed into morning/afternoon/evening (Asia/Kolkata)              |
 | `/admin/bookings`  | Day book with status transitions and POS collection (UPI / cash)             |
@@ -56,11 +56,11 @@ code and the modal fills it in for you.
 | `/admin/reviews`   | Review inbox, low-score alerts and public owner replies                      |
 | `/admin/reminders` | Retention funnel (scheduled/sent/delivered/opened/clicked/converted), consent-aware send, manual dispatch and per-row delivery status |
 | `/admin/invoices`  | Collected bills with tax, commission and partner settlement totals           |
-| `/admin/settlements` | Captured invoice days, commission, partner payout, online payment attempts and refunds |
+| `/admin/settlements` | Captured invoice days, commission, partner payout, recorded payouts, online payment attempts and refunds |
 | `/admin/services`  | Add services, publish/hide, pricing in paise rendered as ₹                    |
 | `/admin/staff`     | Add artists, view working days, apply a Mon–Sat schedule                     |
 | `/admin/resources` | Rooms, chairs and stations that bookable services depend on                  |
-| `/platform`        | Platform-admin KYC review queue, salon status and marketplace commission      |
+| `/platform`        | Platform-admin KYC review queue + document view, salon pause/activate, user role/status controls, payout recording and audit log |
 
 `/admin/*` is guarded by `components/partner-gate.tsx`; a customer session sees a
 "switch account" prompt instead of the console. Owners with more than one salon get a
@@ -80,9 +80,13 @@ switcher in the admin sidebar; the choice is stored as `gc_active_salon` and sen
 - `components/partner-gate.tsx` — role gate for the owner console.
 - `lib/images.ts` — stable Unsplash imagery keyed by category, since the API stores S3 keys
   that aren't wired to a bucket yet.
-- `uploadFile()` in `lib/api.ts` asks the API for a presigned S3 URL, then `PUT`s the file
-  directly to storage. Without `S3_*` credentials the API returns `503` and the UI reports
-  storage as unconfigured instead of pretending the upload worked.
+- `uploadFile()` in `lib/api.ts` runs the two-step upload: presign with a declared type and
+  size, `PUT` the bytes directly to storage, then confirm so the API can HEAD the object and
+  verify what was actually stored. Without `S3_*` credentials the API returns `503` and the UI
+  reports storage as unconfigured instead of pretending the upload worked.
+- Refunds send a fresh `Idempotency-Key`, so retrying a failed request cannot refund twice.
+- Payouts are recorded by the platform team; the settlements page shows the computed partner
+  net and the transfers that were actually recorded.
 
 ## Notes
 

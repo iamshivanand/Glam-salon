@@ -16,6 +16,10 @@ import { useAuth, useAuthModal, isOwner } from '@/lib/store';
 
 const SALON_TYPES = ['UNISEX', 'WOMEN_ONLY', 'MEN_ONLY', 'HOME_SERVICE'] as const;
 
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+
 export default function OnboardingPage() {
   const { user, hydrated } = useAuth();
   const { openModal } = useAuthModal();
@@ -45,6 +49,7 @@ export default function OnboardingPage() {
     bank_account_number: '',
     bank_ifsc: '',
     shop_license_s3_key: '',
+    shop_license_name: '',
   });
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -111,8 +116,8 @@ export default function OnboardingPage() {
     setProblem(null);
     try {
       const uploaded = await uploadFile(file, 'kyc_document', salon.data?.id);
-      setKycForm({ ...kycForm, shop_license_s3_key: uploaded.key });
-      setNotice('Licence uploaded. Submit KYC to finish.');
+      setKycForm({ ...kycForm, shop_license_s3_key: uploaded.key, shop_license_name: file.name });
+      setNotice('Licence uploaded and verified. Submit KYC to finish.');
     } catch (err: any) {
       setProblem(err.message);
     }
@@ -121,12 +126,22 @@ export default function OnboardingPage() {
   const saveKyc = async () => {
     setNotice(null);
     setProblem(null);
+    const pan = kycForm.pan_number.replace(/\s+/g, '').toUpperCase();
+    const gstin = kycForm.gstin.replace(/\s+/g, '').toUpperCase();
+    const ifsc = kycForm.bank_ifsc.replace(/\s+/g, '').toUpperCase();
+    const account = kycForm.bank_account_number.replace(/\s+/g, '');
+
+    if (!PAN_RE.test(pan)) return setProblem('PAN must look like ABCDE1234F.');
+    if (gstin && !GSTIN_RE.test(gstin)) return setProblem('GSTIN must be a 15-character GST number.');
+    if (!/^\d{6,20}$/.test(account)) return setProblem('Bank account number must be 6-20 digits.');
+    if (!IFSC_RE.test(ifsc)) return setProblem('IFSC must look like HDFC0001234.');
+
     try {
       await submitKyc.mutateAsync({
-        pan_number: kycForm.pan_number.toUpperCase(),
-        gstin: kycForm.gstin || undefined,
-        bank_account_number: kycForm.bank_account_number,
-        bank_ifsc: kycForm.bank_ifsc,
+        pan_number: pan,
+        gstin: gstin || undefined,
+        bank_account_number: account,
+        bank_ifsc: ifsc,
         shop_license_s3_key: kycForm.shop_license_s3_key || undefined,
       });
       setNotice('KYC submitted. Our team reviews it before the salon goes live.');
@@ -238,16 +253,16 @@ export default function OnboardingPage() {
           <p className="text-xs opacity-60">PAN and bank account are encrypted at rest. We never return them in responses.</p>
           <div className="grid sm:grid-cols-2 gap-3">
             <label className="text-xs opacity-60">PAN
-              <input value={kycForm.pan_number} onChange={(e) => setKycForm({ ...kycForm, pan_number: e.target.value.toUpperCase() })} maxLength={10} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
+              <input value={kycForm.pan_number} onChange={(e) => setKycForm({ ...kycForm, pan_number: e.target.value.toUpperCase() })} maxLength={10} placeholder="ABCDE1234F" className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
             </label>
             <label className="text-xs opacity-60">GSTIN (optional)
-              <input value={kycForm.gstin} onChange={(e) => setKycForm({ ...kycForm, gstin: e.target.value.toUpperCase() })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
+              <input value={kycForm.gstin} onChange={(e) => setKycForm({ ...kycForm, gstin: e.target.value.toUpperCase() })} maxLength={15} placeholder="29ABCDE1234F1Z5" className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
             </label>
             <label className="text-xs opacity-60">Bank account
-              <input value={kycForm.bank_account_number} onChange={(e) => setKycForm({ ...kycForm, bank_account_number: e.target.value })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
+              <input value={kycForm.bank_account_number} onChange={(e) => setKycForm({ ...kycForm, bank_account_number: e.target.value })} maxLength={20} inputMode="numeric" placeholder="6-20 digits" className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
             </label>
             <label className="text-xs opacity-60">IFSC
-              <input value={kycForm.bank_ifsc} onChange={(e) => setKycForm({ ...kycForm, bank_ifsc: e.target.value.toUpperCase() })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
+              <input value={kycForm.bank_ifsc} onChange={(e) => setKycForm({ ...kycForm, bank_ifsc: e.target.value.toUpperCase() })} maxLength={11} placeholder="HDFC0001234" className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
             </label>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -256,7 +271,10 @@ export default function OnboardingPage() {
               <input type="file" accept="application/pdf,image/jpeg,image/png" className="hidden" onChange={(e) => e.target.files?.[0] && uploadLicense(e.target.files[0])} />
             </label>
             <span className="text-[11px] opacity-50">
-              {kycForm.shop_license_s3_key ? `Stored: ${kycForm.shop_license_s3_key.slice(0, 40)}…` : 'PDF or image'}
+              {kycForm.shop_license_name ||
+                (kycForm.shop_license_s3_key || salon.data.kyc?.shop_license_s3_key
+                  ? 'Licence on file'
+                  : 'PDF or image, up to 10 MB')}
             </span>
             <span className="text-[11px] opacity-50">
               Storage: {uploadStatus.data?.configured ? uploadStatus.data.provider : 'not configured'}

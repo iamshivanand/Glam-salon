@@ -10,7 +10,14 @@ import { listReminders, triggerReminders } from '../services/reminders.js';
 import { dispatchReminders } from '../services/dispatcher.js';
 import { liveQueue, updateQueueStatus } from '../services/queue.js';
 import { reminderFunnel } from '../services/engagement.js';
-import { listPaymentsForSalon, refundPayment, settlementsForSalon } from '../services/payments.js';
+import {
+  listPaymentsForSalon,
+  payoutsForSalon,
+  refundPayment,
+  settlementsForSalon,
+} from '../services/payments.js';
+import { recordAudit } from '../services/audit.js';
+import { isValidGstin, isValidIfsc, isValidPan, normalizeCode } from '../validation.js';
 import { fmtLocalDate } from '../services/availability.js';
 
 const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
@@ -24,7 +31,13 @@ async function resolveSalonId(req: any): Promise<string> {
       `SELECT id FROM salons WHERE id = $1 AND (owner_id = $2 OR $3 = 'PLATFORM_ADMIN')`,
       [requested, req.auth.id, req.auth.role],
     );
-    if (!owned) throw forbidden('You do not manage this salon');
+    if (owned) return requested;
+    const linked = await one(
+      `SELECT salon_id FROM staff_members
+        WHERE salon_id = $1 AND user_id = $2 AND is_active LIMIT 1`,
+      [requested, req.auth.id],
+    );
+    if (!linked) throw forbidden('You do not manage this salon');
     return requested;
   }
   if (req.auth.salonId) return req.auth.salonId;
@@ -76,10 +89,21 @@ const SalonPatch = SalonCreate.partial().extend({
 });
 
 const KycInput = z.object({
-  pan_number: z.string().min(10).max(10),
-  gstin: z.string().max(20).optional(),
-  bank_account_number: z.string().min(6).max(34),
-  bank_ifsc: z.string().min(4).max(16),
+  pan_number: z
+    .string()
+    .transform(normalizeCode)
+    .refine(isValidPan, 'PAN must look like ABCDE1234F'),
+  gstin: z
+    .string()
+    .transform(normalizeCode)
+    .refine((value) => value === '' || isValidGstin(value), 'GSTIN must be a 15-character GST number')
+    .optional()
+    .transform((value) => (value ? value : undefined)),
+  bank_account_number: z.string().regex(/^\d{6,20}$/, 'Bank account number must be 6-20 digits'),
+  bank_ifsc: z
+    .string()
+    .transform(normalizeCode)
+    .refine(isValidIfsc, 'IFSC must look like HDFC0001234'),
   shop_license_s3_key: z.string().max(512).optional(),
 });
 
@@ -173,7 +197,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
                 AND b.scheduled_start_at >= NOW() AND b.status IN ('REQUESTED','CONFIRMED','ARRIVED','IN_SERVICE')
               ) AS upcoming_bookings
          FROM salons s
-        WHERE ($2 = 'PLATFORM_ADMIN' OR s.owner_id = $1)
+        WHERE ($2 = 'PLATFORM_ADMIN'
+               OR s.owner_id = $1
+               OR EXISTS (SELECT 1 FROM staff_members sm
+                           WHERE sm.salon_id = s.id AND sm.user_id = $1 AND sm.is_active))
         ORDER BY s.created_at`,
       [req.auth!.id, req.auth!.role],
     );
@@ -240,15 +267,46 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     const salonId = await resolveSalonId(req);
     const kyc = await one(`SELECT id FROM salon_kyc_verifications WHERE salon_id = $1`, [salonId]);
     if (!kyc) throw badRequest('KYC_REQUIRED', 'Submit PAN, bank details and shop licence before verification');
-    return one(
-      `UPDATE salons SET verification_status = 'SUBMITTED' WHERE id = $1 RETURNING id, verification_status`,
+    const updated = await one(
+      `UPDATE salons SET verification_status = 'SUBMITTED'
+        WHERE id = $1 AND verification_status IN ('DRAFT', 'REJECTED')
+        RETURNING id, verification_status`,
       [salonId],
     );
+    if (!updated) {
+      const current = await one<{ verification_status: string }>(
+        `SELECT verification_status FROM salons WHERE id = $1`,
+        [salonId],
+      );
+      throw conflict(
+        'INVALID_STATUS',
+        current?.verification_status === 'APPROVED'
+          ? 'This salon is already approved'
+          : `Cannot submit a salon with status ${current?.verification_status ?? 'unknown'}`,
+      );
+    }
+    return updated;
   });
 
   app.post('/partner/kyc', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
     const body = parse(KycInput, req.body);
+
+    if (body.shop_license_s3_key) {
+      const upload = await one<{ purpose: string; status: string; salon_id: string | null }>(
+        `SELECT purpose, status, salon_id FROM uploads WHERE s3_key = $1 AND user_id = $2`,
+        [body.shop_license_s3_key, req.auth!.id],
+      );
+      if (
+        !upload ||
+        upload.purpose !== 'kyc_document' ||
+        upload.status !== 'UPLOADED' ||
+        upload.salon_id !== salonId
+      ) {
+        throw badRequest('INVALID_KEY', 'Shop licence must be a confirmed KYC upload for this salon');
+      }
+    }
+
     const row = await one(
       `INSERT INTO salon_kyc_verifications
          (salon_id, pan_number_encrypted, gstin, bank_account_encrypted, bank_ifsc,
@@ -259,22 +317,40 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
          gstin = EXCLUDED.gstin,
          bank_account_encrypted = EXCLUDED.bank_account_encrypted,
          bank_ifsc = EXCLUDED.bank_ifsc,
-         shop_license_s3_key = EXCLUDED.shop_license_s3_key,
+         shop_license_s3_key = COALESCE(EXCLUDED.shop_license_s3_key, salon_kyc_verifications.shop_license_s3_key),
          status = 'SUBMITTED',
          rejection_reason = NULL
        RETURNING id, gstin, bank_ifsc, shop_license_s3_key, status, updated_at`,
       [
         salonId,
-        encrypt(body.pan_number.toUpperCase()),
+        encrypt(body.pan_number),
         body.gstin ?? null,
         encrypt(body.bank_account_number),
-        body.bank_ifsc.toUpperCase(),
+        body.bank_ifsc,
         body.shop_license_s3_key ?? null,
       ],
     );
-    await query(`UPDATE salons SET verification_status = 'SUBMITTED' WHERE id = $1 AND verification_status = 'DRAFT'`, [
+
+    // Re-submission after a rejection must put the salon back in the review
+    // queue. An approved salon keeps its status so it stays discoverable while
+    // bank-detail updates are reviewed.
+    await query(
+      `UPDATE salons SET verification_status = 'SUBMITTED'
+        WHERE id = $1 AND verification_status IN ('DRAFT', 'REJECTED')`,
+      [salonId],
+    );
+
+    await recordAudit({
+      actorId: req.auth!.id,
+      actorRole: req.auth!.role,
       salonId,
-    ]);
+      action: 'kyc.submitted',
+      entityType: 'salon_kyc_verification',
+      entityId: salonId,
+      metadata: { has_shop_licence: Boolean(body.shop_license_s3_key) },
+      ip: req.ip,
+    });
+
     return row;
   });
 
@@ -694,13 +770,23 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       }),
       req.body ?? {},
     );
+    const header = req.headers['idempotency-key'];
     return refundPayment({
       salonId,
       paymentId: id,
       amountPaise: body.amount_paise,
       reason: body.reason,
       actorId: req.auth!.id,
+      actorRole: req.auth!.role,
+      idempotencyKey: typeof header === 'string' ? header : undefined,
+      ip: req.ip,
     });
+  });
+
+  app.get('/partner/payouts', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+    const salonId = await resolveSalonId(req);
+    const q = parse(z.object({ limit: z.coerce.number().int().min(1).max(100).optional() }), req.query);
+    return { payouts: await payoutsForSalon(salonId, q.limit ?? 24) };
   });
 
   app.get('/partner/settlements', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {

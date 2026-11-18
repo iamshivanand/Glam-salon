@@ -18,6 +18,7 @@ import {
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { theme } from './theme';
 import { useAuth, useBooking, useUi, type Tab } from './store';
+import { registerForPush, subscribeToNotificationTaps } from './notifications';
 import {
   cancelBooking,
   createBooking,
@@ -1187,6 +1188,14 @@ function Shell() {
   useEffect(() => {
     void hydrate();
   }, [hydrate]);
+
+  // Reminders are delivered by push; register this device once the user is known.
+  useEffect(() => {
+    if (!user) return;
+    void registerForPush();
+  }, [user?.id]);
+
+  useEffect(() => subscribeToNotificationTaps(() => setTab('visits')), [setTab]);
 
   return (
     <VStack flex={1} bg="cream.50" safeArea>

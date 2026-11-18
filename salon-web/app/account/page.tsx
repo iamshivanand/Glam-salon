@@ -7,10 +7,14 @@ import {
   uploadFile,
   useAddAddress,
   useAddresses,
+  useConsentHistory,
   useConsents,
+  useDeleteAccount,
   useDeleteAddress,
   useMe,
   usePayments,
+  useRevokeAllSessions,
+  useSessions,
   useSetAvatar,
   useSetConsent,
   useUpdateMe,
@@ -26,11 +30,12 @@ const PURPOSES = [
 ] as const;
 
 export default function AccountPage() {
-  const { user, hydrated } = useAuth();
+  const { user, hydrated, logout } = useAuth();
   const { openModal } = useAuthModal();
   const me = useMe(!!user);
   const updateMe = useUpdateMe();
   const consents = useConsents(!!user);
+  const consentHistory = useConsentHistory(!!user);
   const setConsent = useSetConsent();
   const addresses = useAddresses(!!user);
   const addAddress = useAddAddress();
@@ -38,6 +43,9 @@ export default function AccountPage() {
   const setAvatar = useSetAvatar();
   const uploadStatus = useUploadStatus();
   const payments = usePayments(!!user);
+  const sessions = useSessions(!!user);
+  const revokeAllSessions = useRevokeAllSessions();
+  const deleteAccount = useDeleteAccount();
 
   const [form, setForm] = useState({ full_name: '', email: '', gender: '', date_of_birth: '' });
   const [address, setAddress] = useState({
@@ -51,6 +59,8 @@ export default function AccountPage() {
   });
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [showDelete, setShowDelete] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState('');
 
   useEffect(() => {
     if (!me.data) return;
@@ -119,6 +129,33 @@ export default function AccountPage() {
     const rows = consents.data?.consents ?? [];
     const specific = rows.find((c) => c.purpose === purpose && c.channel === channel && c.salon_id === null);
     return specific?.is_granted ?? purpose === 'RETENTION_REMINDER';
+  };
+
+  const signOutEverywhere = async () => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      const result = await revokeAllSessions.mutateAsync();
+      await logout();
+      setNotice(`Signed out of ${result.revoked} session${result.revoked === 1 ? '' : 's'}.`);
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const removeAccount = async () => {
+    setNotice(null);
+    setProblem(null);
+    if (deleteConfirm !== 'DELETE') {
+      setProblem('Type DELETE to confirm account deletion.');
+      return;
+    }
+    try {
+      await deleteAccount.mutateAsync();
+      await logout();
+    } catch (err: any) {
+      setProblem(err.message);
+    }
   };
 
   return (
@@ -214,6 +251,46 @@ export default function AccountPage() {
         <p className="text-[11px] opacity-50">
           Replying STOP to a WhatsApp or SMS reminder opts you out across salons immediately.
         </p>
+
+        <details className="pt-2">
+          <summary className="text-xs cursor-pointer opacity-70">Consent history</summary>
+          <ul className="mt-2 space-y-1 text-xs">
+            {(consentHistory.data?.events ?? []).slice(0, 12).map((event) => (
+              <li key={event.id} className="flex flex-wrap items-center gap-2 border-t border-line pt-1">
+                <span className="opacity-60">
+                  {new Date(event.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+                </span>
+                <span>{event.purpose}</span>
+                <span className="opacity-60">{event.channel}</span>
+                <span className={event.is_granted ? 'text-green-700' : 'text-red-700'}>
+                  {event.is_granted ? 'granted' : 'revoked'}
+                </span>
+              </li>
+            ))}
+            {!consentHistory.data?.events.length && <li className="opacity-60">No consent changes recorded yet.</li>}
+          </ul>
+        </details>
+      </section>
+
+      <section className="card p-6 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="font-semibold">Sessions &amp; devices</h2>
+          <button onClick={signOutEverywhere} disabled={revokeAllSessions.isPending} className="chip !py-1 !px-3 text-xs">
+            {revokeAllSessions.isPending ? 'Signing out…' : 'Sign out everywhere'}
+          </button>
+        </div>
+        <div className="space-y-2">
+          {(sessions.data?.sessions ?? []).map((session) => (
+            <div key={session.id} className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2 text-sm">
+              <span>{session.device_fingerprint ? session.device_fingerprint.slice(0, 48) : 'Unknown device'}</span>
+              <span className="text-xs opacity-60">{session.ip_address ?? 'no IP'}</span>
+              <span className="text-xs opacity-60">
+                started {new Date(session.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
+              </span>
+            </div>
+          ))}
+          {!sessions.data?.sessions.length && <p className="text-sm opacity-60">No active sessions.</p>}
+        </div>
       </section>
 
       <section className="card p-6 space-y-3">
@@ -256,6 +333,38 @@ export default function AccountPage() {
           ))}
           {!payments.data?.payments.length && <p className="text-sm opacity-60">No online payments yet.</p>}
         </div>
+      </section>
+
+      <section className="card p-6 space-y-3 border-red-200">
+        <h2 className="font-semibold text-red-700">Delete account</h2>
+        <p className="text-xs opacity-60">
+          This removes your profile details, addresses, push tokens and sessions. Past bookings and invoices are
+          retained without your name for accounting and dispute handling. Upcoming bookings must be cancelled first.
+        </p>
+        {!showDelete ? (
+          <button onClick={() => setShowDelete(true)} className="chip !py-2 text-xs text-red-700">
+            Delete my account
+          </button>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={deleteConfirm}
+              onChange={(e) => setDeleteConfirm(e.target.value.toUpperCase())}
+              placeholder="Type DELETE"
+              className="border border-line rounded-xl px-3 py-2 bg-transparent text-sm"
+            />
+            <button
+              onClick={removeAccount}
+              disabled={deleteAccount.isPending || deleteConfirm !== 'DELETE'}
+              className="chip !py-2 text-xs text-red-700 border-red-300 disabled:opacity-40"
+            >
+              {deleteAccount.isPending ? 'Deleting…' : 'Permanently delete'}
+            </button>
+            <button onClick={() => { setShowDelete(false); setDeleteConfirm(''); }} className="text-xs underline opacity-60">
+              Cancel
+            </button>
+          </div>
+        )}
       </section>
     </div>
   );

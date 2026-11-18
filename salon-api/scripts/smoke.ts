@@ -21,7 +21,8 @@ async function call<T = any>(
   path: string,
   opts: { method?: string; body?: unknown; token?: string; key?: string } = {},
 ): Promise<T> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = {};
+  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
   if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
   if (opts.key) headers['Idempotency-Key'] = opts.key;
   const res = await fetch(`${API}${path}`, {
@@ -227,6 +228,74 @@ async function main() {
   const admin = await login('+919800000009');
   const stats = await call<any>('/admin/stats', { token: admin.access_token });
   ok('admin stats', `${stats.salons.total} salons · ${stats.users.customers} customers`);
+
+  const audit = await call<any>('/admin/audit?limit=5', { token: admin.access_token });
+  ok('admin audit log', `${audit.events.length} recent events`);
+
+  // Uploads are registered and size-checked even when no bucket is configured.
+  const uploadStatus = await call<any>('/uploads/status');
+  ok(
+    'upload limits',
+    `image ${Math.floor(uploadStatus.max_image_bytes / (1024 * 1024))} MB · pdf ${Math.floor(uploadStatus.max_pdf_bytes / (1024 * 1024))} MB`,
+  );
+  try {
+    await call('/uploads/presign', {
+      method: 'POST',
+      token: customer.access_token,
+      body: { purpose: 'avatar', content_type: 'image/png', size_bytes: 2048 },
+    });
+    fail('presign blocked without storage', 'expected 503');
+  } catch (err) {
+    ok('presign blocked without storage', err instanceof Error ? err.message.slice(0, 40) : '503');
+  }
+
+  // Business identifier formats are rejected before anything is stored.
+  try {
+    await call('/partner/kyc', {
+      method: 'POST',
+      token: owner.access_token,
+      body: { pan_number: 'BADPAN', bank_account_number: '123456', bank_ifsc: 'HDFC0001234' },
+    });
+    fail('KYC format validation', 'invalid PAN was accepted');
+  } catch (err) {
+    ok('KYC format validation', err instanceof Error ? err.message.slice(0, 60) : '400');
+  }
+
+  const payouts = await call<any>('/partner/payouts', { token: owner.access_token });
+  ok('partner payouts', `${payouts.payouts.length} recorded`);
+
+  try {
+    await call('/partner/payments/00000000-0000-0000-0000-000000000000/refund', {
+      method: 'POST',
+      token: owner.access_token,
+      key: `smoke-refund-${Date.now()}`,
+      body: {},
+    });
+    fail('refund rejects unknown payment', 'expected 404');
+  } catch (err) {
+    ok('refund rejects unknown payment', err instanceof Error ? err.message.slice(0, 40) : '404');
+  }
+
+  // Account controls run on a throwaway phone so demo data is untouched.
+  const tempPhone = `+9199${String(Date.now()).slice(-8)}`;
+  const temp = await login(tempPhone);
+  const sessions = await call<any>('/users/me/sessions', { token: temp.access_token });
+  ok('session list', `${sessions.sessions.length} active`);
+  await call('/users/me/consents', {
+    method: 'POST',
+    token: temp.access_token,
+    body: { channel: 'EMAIL', purpose: 'PROMOTIONAL_OFFERS', is_granted: true },
+  });
+  const consentHistory = await call<any>('/users/me/consents/history', { token: temp.access_token });
+  ok('consent history', `${consentHistory.events.length} events`);
+  const revoked = await call<any>('/users/me/sessions/revoke-all', {
+    method: 'POST',
+    token: temp.access_token,
+    body: {},
+  });
+  ok('revoke all sessions', `${revoked.revoked} revoked`);
+  const deletion = await call<any>('/users/me', { method: 'DELETE', token: temp.access_token });
+  ok('account deletion', deletion.ok ? 'soft-deleted with identifiers removed' : 'unexpected response');
 
   // Authorization checks
   try {
