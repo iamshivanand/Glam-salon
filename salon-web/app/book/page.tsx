@@ -18,25 +18,16 @@ import {
 } from '@/lib/api';
 import { useAuth, useAuthModal, useBooking } from '@/lib/store';
 import { serviceImage, staffImage } from '@/lib/images';
+import { clearPaymentKey, openRazorpayCheckout, paymentKey } from '@/lib/razorpay';
 
 function todayIST() {
   return new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
 }
 
-function loadScript(src: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const script = document.createElement('script');
-    script.src = src;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error('Could not load the payment checkout'));
-    document.body.appendChild(script);
-  });
-}
-
 export default function BookPage() {
   const [step, setStep] = useState(1);
   const [confirmation, setConfirmation] = useState<{
+    id: string;
     booking_code: string;
     checkin_pin: string;
     scheduled_start_at: string;
@@ -112,7 +103,10 @@ export default function BookPage() {
       setConfirmation(booking);
       if (payMode === 'PAY_ONLINE') {
         try {
-          const intent = await createIntent.mutateAsync({ booking_id: booking.id });
+          const intent = await createIntent.mutateAsync({
+            booking_id: booking.id,
+            idempotency_key: paymentKey(booking.id),
+          });
           setPaymentIntent(intent);
           if (!intent.checkout) {
             setPaymentNotice(intent.instructions ?? 'Online payment is not configured; pay at the salon.');
@@ -140,32 +134,25 @@ export default function BookPage() {
     if (!paymentIntent?.checkout) return;
     setPaymentNotice(null);
     try {
-      await loadScript('https://checkout.razorpay.com/v1/checkout.js');
-      const checkout = paymentIntent.checkout;
       const contact = user?.phone?.replace(/^\+?91/, '');
-      const rzp = new (window as any).Razorpay({
-        key: checkout.key,
-        amount: checkout.amount,
-        currency: checkout.currency,
-        order_id: checkout.order_id,
-        name: 'Glam Connect',
+      await openRazorpayCheckout({
+        checkout: paymentIntent.checkout,
         description: confirmation?.booking_code,
         prefill: {
           ...(user?.full_name ? { name: user.full_name } : {}),
           ...(contact ? { contact } : {}),
           ...(me.data?.email ? { email: me.data.email } : {}),
         },
-        handler: async (response: any) => {
+        onSuccess: async (response) => {
           try {
             await verifyPayment.mutateAsync({ paymentId: paymentIntent.payment_id, ...response });
+            if (confirmation) clearPaymentKey(confirmation.id);
             setPaymentNotice('Payment captured. A receipt has been queued.');
           } catch (err: any) {
             setPaymentNotice(err.message);
           }
         },
-        theme: { color: '#7c3aed' },
       });
-      rzp.open();
     } catch (err: any) {
       setPaymentNotice(err.message);
     }

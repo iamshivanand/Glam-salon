@@ -2,8 +2,18 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { useCancelBooking, useMyBookings, useSubmitReview, rupees } from '@/lib/api';
+import {
+  useCancelBooking,
+  useCreatePaymentIntent,
+  useMe,
+  useMyBookings,
+  usePayments,
+  useSubmitReview,
+  useVerifyPayment,
+  rupees,
+} from '@/lib/api';
 import { useAuth, useAuthModal } from '@/lib/store';
+import { clearPaymentKey, openRazorpayCheckout, paymentKey } from '@/lib/razorpay';
 
 const STATUS_LABEL: Record<string, string> = {
   REQUESTED: 'Awaiting salon approval',
@@ -85,12 +95,83 @@ function ReviewForm({ bookingId }: { bookingId: string }) {
   );
 }
 
+function CompletePayment({ bookingId, bookingCode }: { bookingId: string; bookingCode: string }) {
+  const { user } = useAuth();
+  const me = useMe(!!user);
+  const createIntent = useCreatePaymentIntent();
+  const verifyPayment = useVerifyPayment();
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const pay = async () => {
+    setBusy(true);
+    setProblem(null);
+    setNotice(null);
+    try {
+      const intent = await createIntent.mutateAsync({
+        booking_id: bookingId,
+        idempotency_key: paymentKey(bookingId),
+      });
+      if (!intent.checkout) {
+        setProblem(intent.instructions ?? 'Online payment is not available for this booking.');
+        return;
+      }
+      const contact = user?.phone?.replace(/^\+?91/, '');
+      await openRazorpayCheckout({
+        checkout: intent.checkout,
+        description: bookingCode,
+        prefill: {
+          ...(user?.full_name ? { name: user.full_name } : {}),
+          ...(contact ? { contact } : {}),
+          ...(me.data?.email ? { email: me.data.email } : {}),
+        },
+        onSuccess: async (response) => {
+          try {
+            await verifyPayment.mutateAsync({ paymentId: intent.payment_id, ...response });
+            clearPaymentKey(bookingId);
+            setNotice('Payment captured. A receipt has been queued.');
+          } catch (err: any) {
+            setProblem(err.message);
+          }
+        },
+      });
+    } catch (err: any) {
+      setProblem(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button onClick={pay} disabled={busy} className="btn-accent !py-2 !px-4 text-sm">
+        {busy ? 'Opening checkout…' : 'Complete payment'}
+      </button>
+      {notice && <span className="text-xs opacity-70">{notice}</span>}
+      {problem && <span className="text-xs text-red-600">{problem}</span>}
+    </div>
+  );
+}
+
 export default function AppointmentsPage() {
   const { user, hydrated } = useAuth();
   const { openModal } = useAuthModal();
   const { data, isLoading } = useMyBookings(!!user);
+  const payments = usePayments(!!user);
   const cancel = useCancelBooking();
   const bookings = data?.bookings ?? [];
+
+  // Latest payment order per booking decides whether an online payment is
+  // still outstanding (an abandoned checkout leaves a CREATED order).
+  const latestPayment = new Map<string, { status: string }>();
+  for (const payment of payments.data?.payments ?? []) {
+    if (payment.booking_id && !latestPayment.has(payment.booking_id)) {
+      latestPayment.set(payment.booking_id, payment);
+    }
+  }
+  const paymentPending = (bookingId: string) =>
+    ['CREATED', 'PENDING', 'AUTHORIZED', 'FAILED'].includes(latestPayment.get(bookingId)?.status ?? '');
 
   if (hydrated && !user) {
     return (
@@ -131,6 +212,9 @@ export default function AppointmentsPage() {
             </div>
             <div className="flex flex-wrap items-center justify-between gap-3 mt-4 border-t border-line pt-3">
               <span className="font-display text-xl">{rupees(b.total_payable_paise)}</span>
+              {upcoming && paymentPending(b.id) && (
+                <CompletePayment bookingId={b.id} bookingCode={b.booking_code} />
+              )}
               {upcoming && (
                 <button
                   onClick={() => cancel.mutate({ id: b.id, reason: 'Changed plans' })}

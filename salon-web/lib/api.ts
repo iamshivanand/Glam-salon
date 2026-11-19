@@ -812,8 +812,17 @@ export interface PaymentIntent {
 
 export function useCreatePaymentIntent() {
   return useMutation({
-    mutationFn: (body: { booking_id?: string; invoice_id?: string; amount_paise?: number }) =>
-      api<PaymentIntent>('/payments/intents', { method: 'POST', body, key: crypto.randomUUID() }),
+    mutationFn: (body: {
+      booking_id?: string;
+      invoice_id?: string;
+      amount_paise?: number;
+      idempotency_key: string;
+    }) =>
+      api<PaymentIntent>('/payments/intents', {
+        method: 'POST',
+        body: { booking_id: body.booking_id, invoice_id: body.invoice_id, amount_paise: body.amount_paise },
+        key: body.idempotency_key,
+      }),
   });
 }
 
@@ -829,7 +838,10 @@ export function useVerifyPayment() {
       razorpay_payment_id: string;
       razorpay_signature: string;
     }) => api(`/payments/${paymentId}/verify`, { method: 'POST', body }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['payments'] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['payments'] });
+      qc.invalidateQueries({ queryKey: qk.myBookings });
+    },
   });
 }
 

@@ -209,6 +209,12 @@ export async function createPaymentIntent(opts: {
 }
 
 function intentResponse(order: PaymentOrder): Record<string, unknown> {
+  // Retried intents (same Idempotency-Key) must be able to reopen checkout for
+  // an order that is still open; paid/refunded orders return status only.
+  const checkoutOpen =
+    order.provider === 'razorpay' &&
+    !!order.provider_order_id &&
+    ['CREATED', 'PENDING', 'AUTHORIZED'].includes(order.status);
   return {
     payment_id: order.id,
     provider: order.provider,
@@ -217,6 +223,18 @@ function intentResponse(order: PaymentOrder): Record<string, unknown> {
     currency: order.currency,
     booking_id: order.booking_id,
     invoice_id: order.invoice_id,
+    key_id: order.provider === 'razorpay' ? env.RAZORPAY_KEY_ID : undefined,
+    order_id: order.provider_order_id ?? undefined,
+    checkout:
+      checkoutOpen && order.provider_order_id
+        ? {
+            provider: 'razorpay',
+            key: env.RAZORPAY_KEY_ID,
+            order_id: order.provider_order_id,
+            amount: Number(order.amount_paise),
+            currency: order.currency,
+          }
+        : undefined,
     instructions:
       order.provider === 'manual'
         ? 'Pay at the salon. This records your intent but does not capture money online.'

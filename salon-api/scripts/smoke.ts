@@ -443,6 +443,14 @@ async function main() {
       'razorpay intent idempotency',
       replay.payment_id === intent.payment_id ? 'same payment' : 'DUPLICATE CREATED',
     );
+    // A retried intent must reopen checkout for the still-open order so an
+    // abandoned payment can be resumed instead of stranding the booking.
+    ok(
+      'razorpay intent resume checkout',
+      replay.checkout?.order_id && replay.checkout.order_id === intent.order_id
+        ? `resumed ${replay.checkout.order_id}`
+        : 'NO CHECKOUT FOR OPEN ORDER',
+    );
 
     // Razorpay checkout signature is HMAC-SHA256(order_id|payment_id, secret).
     const syntheticPaymentId = `pay_smoke_${Date.now()}`;
