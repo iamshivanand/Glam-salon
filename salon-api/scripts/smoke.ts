@@ -75,9 +75,14 @@ async function main() {
   console.log(`\nGlam Connect API smoke test → ${BASE}\n`);
 
   // Health
-  const health = (await fetch(`${BASE}/health`).then((r) => r.json())) as any;
+  const healthRes = await fetch(`${BASE}/health`);
+  const health = (await healthRes.json()) as any;
   health.status === 'ok' ? ok('health', health.checks) : fail('health', health);
   health.notifications ? ok('notification providers', health.notifications) : fail('notification providers', health);
+  healthRes.headers.get('x-content-type-options') === 'nosniff' &&
+  healthRes.headers.get('x-frame-options') === 'DENY'
+    ? ok('security headers', 'nosniff · DENY')
+    : fail('security headers', Object.fromEntries(healthRes.headers));
 
   // Auth
   const customer = await login('+919800000002');
