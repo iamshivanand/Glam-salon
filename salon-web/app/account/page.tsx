@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   rupees,
   uploadFile,
@@ -9,10 +9,12 @@ import {
   useAddresses,
   useConsents,
   useDeleteAddress,
+  useDeleteAccount,
   useMe,
   usePayments,
   useSetAvatar,
   useSetConsent,
+  useUpdateAddress,
   useUpdateMe,
   useUploadStatus,
 } from '@/lib/api';
@@ -24,6 +26,7 @@ const PURPOSES = [
   ['PROMOTIONAL_OFFERS', 'Offers & promotions'],
   ['STYLE_PHOTO_STORAGE', 'Style photo storage'],
 ] as const;
+const GENDER_OPTIONS = ['Male', 'Female', 'Non-binary', 'Other', 'Prefer not to say'] as const;
 
 export default function AccountPage() {
   const { user, hydrated } = useAuth();
@@ -35,6 +38,8 @@ export default function AccountPage() {
   const addresses = useAddresses(!!user);
   const addAddress = useAddAddress();
   const deleteAddress = useDeleteAddress();
+  const updateAddress = useUpdateAddress();
+  const deleteAccount = useDeleteAccount();
   const setAvatar = useSetAvatar();
   const uploadStatus = useUploadStatus();
   const payments = usePayments(!!user);
@@ -51,6 +56,20 @@ export default function AccountPage() {
   });
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [editingAddrId, setEditingAddrId] = useState<string | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState('');
+  const [genderOpen, setGenderOpen] = useState(false);
+  const genderDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (genderDropdownRef.current && !genderDropdownRef.current.contains(e.target as Node)) {
+        setGenderOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   useEffect(() => {
     if (!me.data) return;
@@ -79,12 +98,15 @@ export default function AccountPage() {
     setNotice(null);
     setProblem(null);
     try {
-      await updateMe.mutateAsync({
+      const payload: any = {
         full_name: form.full_name,
-        email: form.email || undefined,
         gender: form.gender || undefined,
         date_of_birth: form.date_of_birth || undefined,
-      });
+      };
+      if (!me.data?.email && form.email) {
+        payload.email = form.email;
+      }
+      await updateMe.mutateAsync(payload);
       setNotice('Profile saved.');
     } catch (err: any) {
       setProblem(err.message);
@@ -107,9 +129,33 @@ export default function AccountPage() {
     setNotice(null);
     setProblem(null);
     try {
-      await addAddress.mutateAsync({ ...address, is_default: !addresses.data?.addresses.length });
+      if (editingAddrId) {
+        await updateAddress.mutateAsync({ id: editingAddrId, ...address });
+        setEditingAddrId(null);
+        setNotice('Address updated.');
+      } else {
+        await addAddress.mutateAsync({ ...address, is_default: !addresses.data?.addresses.length });
+        setNotice('Address saved.');
+      }
       setAddress({ ...address, address_line: '', locality: '', postal_code: '' });
-      setNotice('Address saved.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const startEditAddress = (a: any) => {
+    setEditingAddrId(a.id);
+    setAddress({ label: a.label, address_line: a.address_line ?? '', locality: a.locality, city: a.city, postal_code: a.postal_code, lat: a.lat, lng: a.lng });
+  };
+
+  const handleDeleteAccount = async () => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      await deleteAccount.mutateAsync();
+      setNotice('Your account has been scheduled for deletion.');
+      // sign out after short delay
+      setTimeout(() => { window.location.href = '/'; }, 1500);
     } catch (err: any) {
       setProblem(err.message);
     }
@@ -136,23 +182,95 @@ export default function AccountPage() {
 
       <section className="card p-6 space-y-4">
         <h2 className="font-semibold">Profile</h2>
-        <div className="grid sm:grid-cols-2 gap-3">
-          <label className="text-xs opacity-60">
-            Full name
-            <input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
-          </label>
-          <label className="text-xs opacity-60">
-            Email
-            <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
-          </label>
-          <label className="text-xs opacity-60">
-            Gender
-            <input value={form.gender} onChange={(e) => setForm({ ...form, gender: e.target.value })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
-          </label>
-          <label className="text-xs opacity-60">
-            Date of birth
-            <input type="date" value={form.date_of_birth} onChange={(e) => setForm({ ...form, date_of_birth: e.target.value })} className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
-          </label>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <div>
+            <label className="text-xs font-medium opacity-60 block">Full name</label>
+            <input
+              value={form.full_name}
+              onChange={(e) => setForm({ ...form, full_name: e.target.value })}
+              className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm focus:outline-none focus:border-accent transition"
+            />
+          </div>
+          <div>
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-medium opacity-60 block">Email</label>
+              {me.data?.email && (
+                <span className="text-[10px] font-medium text-accent flex items-center gap-1">
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                  Verified & locked
+                </span>
+              )}
+            </div>
+            <input
+              type="email"
+              value={form.email}
+              disabled={!!me.data?.email}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
+              className={`mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm transition ${
+                me.data?.email
+                  ? 'opacity-60 cursor-not-allowed bg-black/5 dark:bg-white/5'
+                  : 'focus:outline-none focus:border-accent'
+              }`}
+            />
+          </div>
+          <div ref={genderDropdownRef} className="relative">
+            <span className="text-xs font-medium opacity-60 block">Gender</span>
+            <button
+              type="button"
+              onClick={() => setGenderOpen(!genderOpen)}
+              className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm flex items-center justify-between text-left hover:border-accent/80 transition focus:outline-none focus:border-accent"
+            >
+              <span className={form.gender ? 'text-ink dark:text-white' : 'opacity-40'}>
+                {form.gender || 'Select gender'}
+              </span>
+              <svg
+                className={`w-4 h-4 opacity-50 transition-transform duration-200 ${genderOpen ? 'rotate-180' : ''}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+
+            {genderOpen && (
+              <div className="absolute left-0 right-0 z-30 mt-1.5 bg-surface border border-line rounded-xl shadow-[0_10px_30px_-10px_rgba(45,27,46,0.15)] p-1.5 space-y-0.5">
+                {GENDER_OPTIONS.map((opt) => (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => {
+                      setForm({ ...form, gender: opt });
+                      setGenderOpen(false);
+                    }}
+                    className={`w-full px-3 py-2 text-sm rounded-lg flex items-center justify-between text-left transition ${
+                      form.gender === opt
+                        ? 'bg-accent/20 text-ink dark:text-white font-medium'
+                        : 'hover:bg-accent/10 opacity-80 hover:opacity-100'
+                    }`}
+                  >
+                    <span>{opt}</span>
+                    {form.gender === opt && (
+                      <svg className="w-4 h-4 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                      </svg>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-xs font-medium opacity-60 block">Date of birth</label>
+            <input
+              type="date"
+              value={form.date_of_birth}
+              onChange={(e) => setForm({ ...form, date_of_birth: e.target.value })}
+              className="mt-1 w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm focus:outline-none focus:border-accent transition"
+            />
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <button onClick={saveProfile} disabled={updateMe.isPending} className="btn-primary !py-2 !px-4 text-sm">
@@ -227,6 +345,7 @@ export default function AccountPage() {
                 <p className="opacity-70">{a.address_line}</p>
                 <p className="text-xs opacity-50">{a.locality}, {a.city} {a.postal_code}</p>
               </div>
+              <button onClick={() => startEditAddress(a)} className="text-xs underline opacity-60">Edit</button>
               <button onClick={() => deleteAddress.mutate(a.id)} className="text-xs underline opacity-60">Remove</button>
             </div>
           ))}
@@ -239,8 +358,13 @@ export default function AccountPage() {
           <input placeholder="City" value={address.city} onChange={(e) => setAddress({ ...address, city: e.target.value })} className="border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
           <input placeholder="PIN code" value={address.postal_code} onChange={(e) => setAddress({ ...address, postal_code: e.target.value })} className="border border-line rounded-xl px-3 py-2 bg-transparent text-sm" />
           <button onClick={saveAddress} disabled={!address.address_line || !address.locality} className="btn-primary !py-2 text-sm">
-            Add address
+            {editingAddrId ? 'Save changes' : 'Add address'}
           </button>
+          {editingAddrId && (
+            <button onClick={() => { setEditingAddrId(null); setAddress({ ...address, address_line: '', locality: '', postal_code: '' }); }} className="text-xs underline opacity-60">
+              Cancel edit
+            </button>
+          )}
         </div>
       </section>
 
@@ -256,6 +380,27 @@ export default function AccountPage() {
           ))}
           {!payments.data?.payments.length && <p className="text-sm opacity-60">No online payments yet.</p>}
         </div>
+      </section>
+
+      <section className="card p-6 space-y-3 border-red-200">
+        <h2 className="font-semibold text-red-600">Delete account</h2>
+        <p className="text-sm opacity-70">
+          This will permanently erase your profile, addresses, preferences and consent records. Completed booking history
+          is retained in anonymised form for salon records. This action cannot be undone.
+        </p>
+        <input
+          value={deleteConfirm}
+          onChange={(e) => setDeleteConfirm(e.target.value)}
+          placeholder='Type "DELETE" to confirm'
+          className="w-full border border-red-200 rounded-xl px-3 py-2 bg-transparent text-sm"
+        />
+        <button
+          onClick={handleDeleteAccount}
+          disabled={deleteConfirm !== 'DELETE' || deleteAccount.isPending}
+          className="bg-red-600 text-white rounded-xl px-4 py-2 text-sm disabled:opacity-40"
+        >
+          {deleteAccount.isPending ? 'Deleting…' : 'Permanently delete my account'}
+        </button>
       </section>
     </div>
   );

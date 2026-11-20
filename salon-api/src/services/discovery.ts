@@ -80,12 +80,12 @@ export async function searchSalons(input: SearchInput) {
 
   const order =
     input.sort === 'rating'
-      ? 's.avg_rating DESC, s.review_count DESC'
+      ? 's.is_sponsored DESC, s.avg_rating DESC, s.review_count DESC'
       : input.sort === 'price'
-        ? 'starting_price_paise ASC NULLS LAST'
+        ? 's.is_sponsored DESC, starting_price_paise ASC NULLS LAST'
         : distanceExpr !== 'NULL::double precision'
-          ? 'distance_km ASC NULLS LAST'
-          : 's.avg_rating DESC';
+          ? 's.is_sponsored DESC, distance_km ASC NULLS LAST'
+          : 's.is_sponsored DESC, s.avg_rating DESC';
 
   params.push(input.pageSize, (input.page - 1) * input.pageSize);
   const limitIdx = params.length - 1;

@@ -15,6 +15,10 @@ const EnvSchema = z.object({
   PHONE_PEPPER: z.string().min(1),
   DEV_RETURN_OTP: z.string().optional(),
 
+  // OAuth2 social login (optional — buttons appear only when configured).
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  APPLE_CLIENT_ID: z.string().optional(),
+
   // Public origins. API_PUBLIC_URL is used for click redirects and provider callbacks.
   APP_PUBLIC_URL: z.string().url().default('http://localhost:3000'),
   API_PUBLIC_URL: z.string().url().default('http://localhost:4000'),

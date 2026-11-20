@@ -32,7 +32,7 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
     return { categories };
   });
 
-  app.get('/discovery/search', async (req) => {
+  const handleSearch = async (req: any) => {
     const q = parse(SearchQuery, req.query);
     const page = pagination(req.query as Record<string, unknown>);
     const priceTier = q.price_tier
@@ -55,7 +55,10 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
       page: page.page,
       pageSize: page.pageSize,
     });
-  });
+  };
+
+  app.get('/discovery/search', handleSearch);
+  app.get('/discovery/salons', handleSearch); // API-09 blueprint route alias
 
   app.get('/discovery/urgent', async (req) => {
     const q = parse(

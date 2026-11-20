@@ -1,11 +1,12 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { one, query } from '../db.js';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { one, query, tx } from '../db.js';
 import { redis, rateLimit } from '../redis.js';
-import { blindIndex, encrypt, decrypt, maskPhone, otpCode, hashOtp, uuid } from '../crypto.js';
+import { blindIndex, encrypt, decrypt, maskPhone, otpCode, hashOtp, uuid, sha256 } from '../crypto.js';
 import { AppError, parse, badRequest, unauthorized, notFound, conflict, forbidden } from '../http.js';
 import { authenticate, issueTokens, rotateRefresh, revokeRefresh } from '../auth.js';
-import { env, devReturnOtp } from '../env.js';
+import { env, devReturnOtp, isDev } from '../env.js';
 import { sendOtpCode } from '../services/notifications.js';
 
 import { isValidPhone, normalizePhone } from '../phone.js';
@@ -58,14 +59,15 @@ function setRefreshCookie(reply: any, token: string) {
 }
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
-  app.post('/auth/otp/request', async (req, reply) => {
+  const handleOtpRequest = async (req: any, reply: any) => {
     const body = parse(OtpRequest, req.body);
     const phone = normalizePhone(body.phone);
     if (!PHONE_RE.test(phone)) throw badRequest('INVALID_PHONE', 'Enter a valid phone number with country code');
 
-    const ipLimit = await rateLimit(`otp:ip:${req.ip}`, 20, 600);
+    const ipLimit = await rateLimit(`otp:ip:${req.ip}`, isDev ? 100 : 20, 600);
+
     if (!ipLimit.allowed) throw new (await import('../http.js')).AppError(429, 'RATE_LIMITED', 'Too many OTP requests. Try again in a few minutes.');
-    const phoneLimit = await rateLimit(`otp:phone:${blindIndex(phone)}`, 5, 600);
+    const phoneLimit = await rateLimit(`otp:phone:${blindIndex(phone)}`, isDev ? 50 : 5, 600);
     if (!phoneLimit.allowed) throw new (await import('../http.js')).AppError(429, 'RATE_LIMITED', 'Too many OTP requests for this number.');
 
     const challengeId = uuid();
@@ -92,7 +94,10 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       channel: env.OTP_CHANNEL,
       ...(devReturnOtp ? { dev_otp: code } : {}),
     };
-  });
+  };
+
+  app.post('/auth/otp/request', handleOtpRequest);
+  app.post('/auth/otp/send', handleOtpRequest); // route alias
 
   app.post('/auth/otp/verify', async (req, reply) => {
     const body = parse(OtpVerify, req.body);
@@ -161,7 +166,74 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true };
   });
 
-  app.get('/auth/me', { preHandler: [authenticate] }, async (req) => {
+  // ---- OAuth2 social login (Google / Apple ID-token verification)
+  const OAuthCallback = z.object({
+    provider: z.enum(['google', 'apple']),
+    id_token: z.string().min(1),
+    full_name: z.string().min(1).max(120).optional(),
+  });
+
+  const googleJwks = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
+  const appleJwks = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+
+  app.post('/auth/oauth/callback', async (req, reply) => {
+    const body = parse(OAuthCallback, req.body);
+
+    let email: string | undefined;
+    let name: string | undefined;
+
+    if (body.provider === 'google') {
+      const clientId = (process.env.GOOGLE_CLIENT_ID ?? env.GOOGLE_CLIENT_ID)?.trim();
+      if (!clientId) throw badRequest('OAUTH_NOT_CONFIGURED', 'Google login is not configured');
+      try {
+        const { payload } = await jwtVerify(body.id_token, googleJwks, {
+          audience: clientId,
+          issuer: ['https://accounts.google.com', 'accounts.google.com'],
+        });
+        email = payload.email as string | undefined;
+        name = (payload.name as string | undefined) ?? body.full_name;
+      } catch (err: any) {
+        throw badRequest('OAUTH_INVALID_TOKEN', `Google token verification failed: ${err.message}`);
+      }
+    } else {
+      const clientId = (process.env.APPLE_CLIENT_ID ?? env.APPLE_CLIENT_ID)?.trim();
+      if (!clientId) throw badRequest('OAUTH_NOT_CONFIGURED', 'Apple login is not configured');
+      try {
+        const { payload } = await jwtVerify(body.id_token, appleJwks, {
+          audience: clientId,
+          issuer: 'https://appleid.apple.com',
+        });
+        email = payload.email as string | undefined;
+        name = body.full_name;
+      } catch (err: any) {
+        throw badRequest('OAUTH_INVALID_TOKEN', `Apple token verification failed: ${err.message}`);
+      }
+    }
+
+    if (!email) throw badRequest('OAUTH_NO_EMAIL', 'The ID token did not include an email address');
+    email = email.toLowerCase();
+
+    let user = await one(`SELECT id, full_name, role, status FROM users WHERE email = $1`, [email]);
+    if (!user) {
+      const placeholderPhone = `oauth_${uuid()}`;
+      user = await one(
+        `INSERT INTO users (phone_e164_encrypted, phone_blind_index, email, full_name, role, status, last_login_at)
+         VALUES ($1, $2, $3, $4, 'CUSTOMER', 'ACTIVE', NOW())
+         RETURNING id, full_name, role, status`,
+        [encrypt(placeholderPhone), sha256(placeholderPhone), email, name ?? 'Glam Guest'],
+      );
+    } else {
+      if (user.status !== 'ACTIVE') throw forbidden('This account is not active. Contact support.');
+      await query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id]);
+    }
+
+    const salon = await one<{ id: string }>(`SELECT id FROM salons WHERE owner_id = $1 ORDER BY created_at LIMIT 1`, [user!.id]);
+    const tokens = await issueTokens({ id: user!.id, role: user!.role, salonId: salon?.id ?? null }, { ip: req.ip });
+    setRefreshCookie(reply, tokens.refresh_token);
+    return { ...tokens, user: { id: user!.id, full_name: user!.full_name, role: user!.role, salon_id: salon?.id ?? null } };
+  });
+
+  const handleGetMe = async (req: any) => {
     const user = await one(
       `SELECT id, full_name, email, role, status, gender, date_of_birth, avatar_s3_key,
               emergency_contacts_json, created_at, phone_e164_encrypted
@@ -169,10 +241,16 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       [req.auth!.id],
     );
     if (!user) throw notFound('User not found');
-    const phone = decrypt(user.phone_e164_encrypted);
+    const rawPhone = decrypt(user.phone_e164_encrypted);
     delete user.phone_e164_encrypted;
-    return { ...user, phone_masked: maskPhone(phone), phone };
-  });
+    const isPlaceholder = rawPhone.startsWith('oauth_') || rawPhone === 'deleted';
+    const phone = isPlaceholder ? '' : rawPhone;
+    const phone_masked = isPlaceholder ? 'Not linked' : maskPhone(rawPhone);
+    return { ...user, phone_masked, phone };
+  };
+
+  app.get('/auth/me', { preHandler: [authenticate] }, handleGetMe);
+  app.get('/users/me', { preHandler: [authenticate] }, handleGetMe); // route alias
 
   app.patch('/users/me', { preHandler: [authenticate] }, async (req) => {
     const body = parse(ProfileUpdate, req.body);
@@ -183,7 +261,13 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       sets.push(`${col} = $${params.length}`);
     };
     if (body.full_name !== undefined) push('full_name', body.full_name);
-    if (body.email !== undefined) push('email', body.email.toLowerCase());
+    if (body.email !== undefined) {
+      const current = await one<{ email: string | null }>(`SELECT email FROM users WHERE id = $1`, [req.auth!.id]);
+      if (current?.email && current.email.toLowerCase() !== body.email.toLowerCase()) {
+        throw badRequest('EMAIL_LOCKED', 'Primary email address is verified and locked to your account');
+      }
+      push('email', body.email.toLowerCase());
+    }
     if (body.gender !== undefined) push('gender', body.gender);
     if (body.date_of_birth !== undefined) push('date_of_birth', body.date_of_birth);
     if (body.emergency_contacts !== undefined) push('emergency_contacts_json', JSON.stringify(body.emergency_contacts));
@@ -262,6 +346,49 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     return { ...row, address_line: body.address_line };
   });
 
+  // ---- Edit address
+  const AddressUpdate = z.object({
+    label: z.string().min(1).max(50).optional(),
+    address_line: z.string().min(3).max(500).optional(),
+    locality: z.string().min(1).max(120).optional(),
+    city: z.string().min(1).max(100).optional(),
+    postal_code: z.string().min(4).max(20).optional(),
+    lat: z.number().min(-90).max(90).optional(),
+    lng: z.number().min(-180).max(180).optional(),
+    is_default: z.boolean().optional(),
+  });
+
+  app.patch('/users/me/addresses/:id', { preHandler: [authenticate] }, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parse(AddressUpdate, req.body);
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    const push = (col: string, value: unknown) => { params.push(value); sets.push(`${col} = $${params.length}`); };
+    if (body.label !== undefined) push('label', body.label);
+    if (body.address_line !== undefined) push('address_line_encrypted', encrypt(body.address_line));
+    if (body.locality !== undefined) push('locality', body.locality);
+    if (body.city !== undefined) push('city', body.city);
+    if (body.postal_code !== undefined) push('postal_code', body.postal_code);
+    if (body.is_default !== undefined) {
+      if (body.is_default) await query(`UPDATE user_addresses SET is_default = FALSE WHERE user_id = $1`, [req.auth!.id]);
+      push('is_default', body.is_default);
+    }
+    if (body.lat !== undefined && body.lng !== undefined) {
+      params.push(body.lng, body.lat);
+      sets.push(`geo_point = ST_SetSRID(ST_MakePoint($${params.length - 1},$${params.length}),4326)::geography`);
+    }
+    if (!sets.length) throw badRequest('VALIDATION_ERROR', 'No fields to update');
+    params.push(id, req.auth!.id);
+    const row = await one(
+      `UPDATE user_addresses SET ${sets.join(', ')} WHERE id = $${params.length - 1} AND user_id = $${params.length}
+       RETURNING id, label, locality, city, postal_code, is_default,
+                 ST_Y(geo_point::geometry) AS lat, ST_X(geo_point::geometry) AS lng`,
+      params,
+    );
+    if (!row) throw notFound('Address not found');
+    return row;
+  });
+
   app.delete('/users/me/addresses/:id', { preHandler: [authenticate] }, async (req) => {
     const { id } = req.params as { id: string };
     const deleted = await query(`DELETE FROM user_addresses WHERE id = $1 AND user_id = $2 RETURNING id`, [
@@ -270,5 +397,26 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     ]);
     if (!deleted.length) throw notFound('Address not found');
     return { ok: true };
+  });
+
+  // ---- DPDP Account Deletion & Anonymization
+  const DeleteAccount = z.object({ confirmation: z.literal('DELETE_MY_ACCOUNT') });
+
+  app.post('/users/me/privacy/delete', { preHandler: [authenticate] }, async (req) => {
+    const body = parse(DeleteAccount, req.body);
+    const userId = req.auth!.id;
+    await tx(async (client) => {
+      await client.query(
+        `UPDATE users SET status = 'DELETED', full_name = 'Deleted User', email = NULL,
+                phone_e164_encrypted = $1, phone_blind_index = $2,
+                gender = NULL, date_of_birth = NULL, emergency_contacts_json = '[]'
+         WHERE id = $3`,
+        [encrypt('deleted'), sha256(`deleted_${userId}`), userId],
+      );
+      await client.query(`DELETE FROM user_addresses WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM customer_consents WHERE user_id = $1`, [userId]);
+      await client.query(`UPDATE user_refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
+    });
+    return { status: 'ANONYMIZATION_SCHEDULED', purge_eta_hrs: 24 };
   });
 };

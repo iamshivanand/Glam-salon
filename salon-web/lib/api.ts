@@ -957,6 +957,25 @@ export function useDeleteAddress() {
   });
 }
 
+export function useUpdateAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string } & Partial<Omit<Address, 'id'>>) =>
+      api(`/users/me/addresses/${id}`, { method: 'PATCH', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'addresses'] }),
+  });
+}
+
+export function useDeleteAccount() {
+  return useMutation({
+    mutationFn: () =>
+      api<{ status: string; purge_eta_hrs: number }>('/users/me/privacy/delete', {
+        method: 'POST',
+        body: { confirmation: 'DELETE_MY_ACCOUNT' },
+      }),
+  });
+}
+
 export function useSetAvatar() {
   const qc = useQueryClient();
   return useMutation({
