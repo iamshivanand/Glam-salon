@@ -14,6 +14,7 @@ import { listPaymentsForSalon, refundPayment, settlementsForSalon } from '../ser
 import { fmtLocalDate } from '../services/availability.js';
 import { invalidateSalonProfileCache } from '../services/discovery.js';
 import { updateBookingStatus } from '../services/booking.js';
+import { redis } from '../redis.js';
 
 const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
@@ -100,6 +101,13 @@ const ServiceInput = z.object({
   quote_questions_schema: z.array(z.any()).optional(),
 });
 
+const StaffBreakInput = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+  start_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'start_time must be HH:MM'),
+  end_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'end_time must be HH:MM'),
+  reason: z.string().max(100).optional(),
+});
+
 const StaffInput = z.object({
   display_name: z.string().min(1).max(100),
   user_id: z.string().uuid().nullish(),
@@ -108,6 +116,18 @@ const StaffInput = z.object({
   is_bgv_verified: z.boolean().optional(),
   home_visit_enabled: z.boolean().optional(),
   commission_share_bps: z.number().int().min(0).max(10000).optional(),
+  service_ids: z.array(z.string().uuid()).optional(),
+  weekly_shifts: z
+    .array(
+      z.object({
+        day_of_week: z.number().int().min(0).max(6),
+        shift_start: z.string().regex(/^\d{2}:\d{2}$/),
+        shift_end: z.string().regex(/^\d{2}:\d{2}$/),
+        breaks: z.array(z.object({ start: z.string(), end: z.string(), reason: z.string().optional() })).optional(),
+        is_working_day: z.boolean().optional(),
+      }),
+    )
+    .optional(),
 });
 
 const ScheduleInput = z.object({
@@ -464,10 +484,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { staff };
   });
 
-  app.post('/partner/staff', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const createStaffHandler = async (req: any, reply: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
     const body = parse(StaffInput, req.body);
-    return one(
+    const staff = await one(
       `INSERT INTO staff_members
          (salon_id, user_id, display_name, specialization, experience_years, is_bgv_verified,
           home_visit_enabled, commission_share_bps)
@@ -483,7 +503,149 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         body.commission_share_bps ?? 0,
       ],
     );
-  });
+    if (!staff) throw badRequest('CREATION_FAILED', 'Could not create staff member');
+
+    if (body.service_ids?.length) {
+      for (const serviceId of body.service_ids) {
+        await query(
+          `INSERT INTO staff_service_mapping (staff_id, salon_service_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [staff.id, serviceId],
+        );
+      }
+    }
+
+    if (body.weekly_shifts?.length) {
+      for (const shift of body.weekly_shifts) {
+        await query(
+          `INSERT INTO staff_schedules (staff_id, day_of_week, shift_start, shift_end, breaks_json, is_working_day)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            staff.id,
+            shift.day_of_week,
+            shift.shift_start,
+            shift.shift_end,
+            JSON.stringify(shift.breaks ?? []),
+            shift.is_working_day ?? true,
+          ],
+        );
+      }
+    }
+
+    await redis.del(`salon:next_slot:${salonId}`).catch(() => {});
+
+    reply.status(201);
+    return {
+      ...staff,
+      service_ids: body.service_ids ?? [],
+      weekly_shifts: body.weekly_shifts ?? [],
+    };
+  };
+
+  app.post('/partner/staff', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createStaffHandler);
+  app.post('/partner/salons/:id/staff', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createStaffHandler); // API-26
+
+  const addStaffBreakHandler = async (req: any, reply: any) => {
+    const salonId = await resolveSalonId(req);
+    const staffId = req.params.staff_id ?? req.params.id;
+    const body = parse(StaffBreakInput, req.body);
+
+    const staff = await one(
+      `SELECT * FROM staff_members WHERE id = $1 AND salon_id = $2`,
+      [staffId, salonId],
+    );
+    if (!staff) throw notFound('Staff member not found');
+
+    const startAt = new Date(`${body.date}T${body.start_time}:00+05:30`);
+    const endAt = new Date(`${body.date}T${body.end_time}:00+05:30`);
+    if (startAt.getTime() >= endAt.getTime()) {
+      throw badRequest('VALIDATION_ERROR', 'end_time must be after start_time');
+    }
+
+    // Existing confirmed bookings cannot be silently overridden by break scheduling
+    const activeBooking = await one<{ booking_code: string }>(
+      `SELECT b.booking_code
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+        WHERE bi.staff_id = $1
+          AND bi.status IN ('CONFIRMED', 'ARRIVED', 'IN_SERVICE')
+          AND bi.time_range && tstzrange($2, $3, '[)')
+        LIMIT 1`,
+      [staffId, startAt.toISOString(), endAt.toISOString()],
+    );
+
+    if (activeBooking) {
+      throw conflict(
+        'CONFLICT_WITH_BOOKING',
+        `Cannot schedule break: overlapping confirmed booking (${activeBooking.booking_code}) exists for this staff member`,
+      );
+    }
+
+    const newBreak = {
+      start: body.start_time,
+      end: body.end_time,
+      reason: body.reason ?? 'Break',
+    };
+
+    const existingOverride = await one<{ id: string; breaks_json: any }>(
+      `SELECT id, breaks_json FROM staff_schedules WHERE staff_id = $1 AND override_date = $2 LIMIT 1`,
+      [staffId, body.date],
+    );
+
+    if (existingOverride) {
+      const existingBreaks = Array.isArray(existingOverride.breaks_json) ? existingOverride.breaks_json : [];
+      const updatedBreaks = [...existingBreaks, newBreak];
+      await query(
+        `UPDATE staff_schedules SET breaks_json = $1 WHERE id = $2`,
+        [JSON.stringify(updatedBreaks), existingOverride.id],
+      );
+    } else {
+      const dow = new Date(`${body.date}T00:00:00Z`).getUTCDay();
+      const normalShift = await one<{ shift_start: string; shift_end: string; breaks_json: any }>(
+        `SELECT shift_start, shift_end, breaks_json FROM staff_schedules WHERE staff_id = $1 AND override_date IS NULL AND day_of_week = $2 LIMIT 1`,
+        [staffId, dow],
+      );
+      const shiftStart = normalShift?.shift_start ?? '09:00:00';
+      const shiftEnd = normalShift?.shift_end ?? '21:00:00';
+      const breaks = normalShift && Array.isArray(normalShift.breaks_json)
+        ? [...normalShift.breaks_json, newBreak]
+        : [newBreak];
+
+      await query(
+        `INSERT INTO staff_schedules (staff_id, day_of_week, override_date, shift_start, shift_end, breaks_json, is_working_day)
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE)`,
+        [staffId, dow, body.date, shiftStart, shiftEnd, JSON.stringify(breaks)],
+      );
+    }
+
+    // Update Redis 96-bit daily availability bitmap
+    const [sh, sm] = body.start_time.split(':').map(Number);
+    const [eh, em] = body.end_time.split(':').map(Number);
+    const startBit = Math.max(0, Math.min(95, Math.floor((sh * 60 + sm) / 15)));
+    const endBit = Math.max(0, Math.min(96, Math.ceil((eh * 60 + em) / 15)));
+
+    const dateNorm = body.date.replace(/-/g, '');
+    const staffBitmapKey = `avail:bitmap:${salonId}:${staffId}:${dateNorm}`;
+    const pipe = redis.pipeline();
+    for (let bit = startBit; bit < endBit; bit++) {
+      pipe.setbit(staffBitmapKey, bit, 1);
+    }
+    pipe.expire(staffBitmapKey, 86400 * 7);
+    pipe.del(`avail:bitmap:${salonId}:${body.date}`);
+    pipe.del(`salon:next_slot:${salonId}`);
+    await pipe.exec().catch(() => {});
+
+    reply.status(201);
+    return {
+      ok: true,
+      staff_id: staffId,
+      date: body.date,
+      break: newBreak,
+      bits_marked: [startBit, Math.max(startBit, endBit - 1)],
+    };
+  };
+
+  app.post('/partner/staff/:staff_id/breaks', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, addStaffBreakHandler); // API-27
+  app.post('/partner/staff/:id/breaks', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, addStaffBreakHandler);
 
   app.patch('/partner/staff/:id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);

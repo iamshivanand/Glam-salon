@@ -871,6 +871,33 @@ export function useSetSchedule() {
   });
 }
 
+export function useAddStaffBreak() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      staffId,
+      date,
+      start_time,
+      end_time,
+      reason,
+    }: {
+      staffId: string;
+      date: string;
+      start_time: string;
+      end_time: string;
+      reason?: string;
+    }) =>
+      api<{ ok: boolean; staff_id: string; date: string; break: { start: string; end: string; reason: string } }>(
+        `/partner/staff/${staffId}/breaks`,
+        { method: 'POST', body: { date, start_time, end_time, reason } },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.partnerStaff });
+      qc.invalidateQueries({ queryKey: ['availability'] });
+    },
+  });
+}
+
 // ------------------------------------------------------------------ multi-salon
 export interface PartnerSalonSummary {
   id: string;
