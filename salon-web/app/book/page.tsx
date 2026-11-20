@@ -60,8 +60,8 @@ export default function BookPage() {
   const availability = useAvailability(activeSalonId, b.serviceIds, b.date, b.staffId);
   const addons = useAddonRecommendations(activeSalonId, b.serviceIds, b.staffId);
   const eligibleAddons = useMemo(
-    () => (addons.data?.addons ?? []).filter((a) => !b.serviceIds.includes(a.addon_service_id)),
-    [addons.data?.addons, b.serviceIds],
+    () => ((addons.data?.addons ?? (addons.data as any)?.recommendations ?? []) as typeof addons.data extends { addons: infer A } ? A : any[]).filter((a) => !b.serviceIds.includes(a.addon_service_id)),
+    [addons.data, b.serviceIds],
   );
   const hold = useHold();
   const create = useCreateBooking();

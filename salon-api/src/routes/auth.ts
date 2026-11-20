@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import { one, query, tx } from '../db.js';
+import { one, query, tx, withUser } from '../db.js';
 import { redis, rateLimit } from '../redis.js';
 import { blindIndex, encrypt, decrypt, maskPhone, otpCode, hashOtp, uuid, sha256 } from '../crypto.js';
 import { AppError, parse, badRequest, unauthorized, notFound, conflict, forbidden } from '../http.js';
@@ -10,6 +10,7 @@ import { env, devReturnOtp, isDev } from '../env.js';
 import { sendOtpCode } from '../services/notifications.js';
 
 import { isValidPhone, normalizePhone } from '../phone.js';
+import { presignGet, publicUrlFor } from '../services/storage.js';
 
 export { normalizePhone } from '../phone.js';
 const PHONE_RE = /^\+[1-9]\d{9,14}$/;
@@ -302,6 +303,52 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       [req.auth!.id, body.salon_id ?? null, body.channel, body.purpose, body.is_granted, req.ip],
     );
     return row;
+  });
+
+  app.get('/users/me/style-vault', { preHandler: [authenticate] }, async (req) => {
+    const rows = await withUser(req.auth!.id, (client) =>
+      client.query(
+        `SELECT c.salon_id, s.name AS salon_name, s.locality,
+                c.preferred_staff_id, sm.display_name AS preferred_staff_name,
+                c.style_preferences_json, c.reference_photo_s3_keys,
+                c.last_visit_at, c.total_visits
+           FROM salon_customer_crm c
+           JOIN salons s ON s.id = c.salon_id
+           LEFT JOIN staff_members sm ON sm.id = c.preferred_staff_id
+          WHERE c.customer_id = $1
+          ORDER BY c.last_visit_at DESC`,
+        [req.auth!.id],
+      ),
+    ).then((r) => r.rows);
+
+    const consent = await one<{ is_granted: boolean }>(
+      `SELECT is_granted FROM customer_consents
+        WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+        ORDER BY salon_id NULLS LAST LIMIT 1`,
+      [req.auth!.id],
+    );
+    const photoConsentGranted = Boolean(consent?.is_granted);
+
+    const vaults = rows.map((r) => {
+      const photos: { key: string; url: string }[] = [];
+      if (photoConsentGranted && Array.isArray(r.reference_photo_s3_keys)) {
+        for (const k of r.reference_photo_s3_keys) {
+          try {
+            photos.push({ key: k, url: presignGet({ key: k, expiresSec: 300 }).url });
+          } catch {
+            const pub = publicUrlFor(k);
+            if (pub) photos.push({ key: k, url: pub });
+          }
+        }
+      }
+      return {
+        ...r,
+        reference_photos: photos,
+        photo_consent_granted: photoConsentGranted,
+      };
+    });
+
+    return { vaults, photo_consent_granted: photoConsentGranted };
   });
 
   app.get('/users/me/addresses', { preHandler: [authenticate] }, async (req) => {

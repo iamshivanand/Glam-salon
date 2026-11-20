@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { one, query, withTenant } from '../db.js';
-import { parse, badRequest, notFound, forbidden, conflict } from '../http.js';
+import { AppError, parse, badRequest, notFound, forbidden, conflict } from '../http.js';
 import { authenticate, requireRole, salonIdForUser } from '../auth.js';
 import { encrypt } from '../crypto.js';
 import { dashboard } from '../services/analytics.js';
@@ -15,6 +15,7 @@ import { fmtLocalDate } from '../services/availability.js';
 import { invalidateSalonProfileCache } from '../services/discovery.js';
 import { updateBookingStatus } from '../services/booking.js';
 import { redis } from '../redis.js';
+import { presignGet, presignPut, publicUrlFor, buildObjectKey, storageConfigured } from '../services/storage.js';
 
 const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
@@ -142,6 +143,16 @@ const ScheduleInput = z.object({
       }),
     )
     .max(7),
+});
+
+const StyleVaultInput = z.object({
+  preferred_staff_id: z.string().uuid().nullish(),
+  preferred_service_ids: z.array(z.string().uuid()).optional(),
+  style_preferences: z.record(z.any()).optional(),
+  style_preferences_json: z.record(z.any()).optional(),
+  request_photo_upload_count: z.number().int().min(0).max(5).optional(),
+  uploaded_photo_keys: z.array(z.string()).optional(),
+  reference_photo_s3_keys: z.array(z.string()).optional(),
 });
 
 export const partnerRoutes: FastifyPluginAsync = async (app) => {
@@ -644,8 +655,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     };
   };
 
-  app.post('/partner/staff/:staff_id/breaks', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, addStaffBreakHandler); // API-27
-  app.post('/partner/staff/:id/breaks', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, addStaffBreakHandler);
+  app.post('/partner/staff/:id/breaks', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, addStaffBreakHandler); // API-27
 
   app.patch('/partner/staff/:id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
@@ -926,49 +936,213 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- CRM (tenant-isolated) ----------
-  app.get('/partner/crm', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const getCustomersHandler = async (req: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
     const q = parse(
-      z.object({ segment: z.enum(['NEW', 'REGULAR', 'AT_RISK', 'INACTIVE']).optional(), q: z.string().optional() }),
+      z.object({
+        segment: z.enum(['NEW', 'REGULAR', 'AT_RISK', 'INACTIVE']).optional(),
+        q: z.string().optional(),
+        due_within_days: z.coerce.number().int().positive().optional(),
+      }),
       req.query,
     );
     const rows = await withTenant(salonId, (client) =>
       client.query(
-        `SELECT c.*, u.full_name AS customer_name
-           FROM salon_customer_crm c JOIN users u ON u.id = c.customer_id
+        `SELECT c.*,
+                u.full_name AS customer_name,
+                u.email AS customer_email,
+                sm.display_name AS preferred_staff_name
+           FROM salon_customer_crm c
+           JOIN users u ON u.id = c.customer_id
+           LEFT JOIN staff_members sm ON sm.id = c.preferred_staff_id
           WHERE c.salon_id = $1
             AND ($2::text IS NULL OR c.retention_segment::text = $2)
-            AND ($3::text IS NULL OR u.full_name ILIKE $3)
+            AND ($3::text IS NULL OR (u.full_name ILIKE $3 OR c.custom_customer_code ILIKE $3))
+            AND ($4::int IS NULL OR (c.next_expected_visit_date IS NOT NULL AND c.next_expected_visit_date <= (CURRENT_DATE + ($4 || ' days')::interval)::date))
           ORDER BY c.last_visit_at DESC LIMIT 200`,
-        [salonId, q.segment ?? null, q.q ? `%${q.q}%` : null],
+        [salonId, q.segment ?? null, q.q ? `%${q.q}%` : null, q.due_within_days ?? null],
       ),
     ).then((r) => r.rows);
     return { customers: rows };
-  });
+  };
 
-  app.get('/partner/crm/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
-    const { customerId } = req.params as { customerId: string };
+  app.get('/partner/crm', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomersHandler);
+  app.get('/partner/salons/:id/customers', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomersHandler); // API-29
+
+  const getCustomerDetailHandler = async (req: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
+    const customerId = req.params.cust_id ?? req.params.customerId;
     const crm = await withTenant(salonId, (client) =>
       client.query(
-        `SELECT c.*, u.full_name AS customer_name, u.email
-           FROM salon_customer_crm c JOIN users u ON u.id = c.customer_id
+        `SELECT c.*,
+                u.full_name AS customer_name,
+                u.email,
+                sm.display_name AS preferred_staff_name
+           FROM salon_customer_crm c
+           JOIN users u ON u.id = c.customer_id
+           LEFT JOIN staff_members sm ON sm.id = c.preferred_staff_id
           WHERE c.salon_id = $1 AND c.customer_id = $2`,
         [salonId, customerId],
       ),
     ).then((r) => r.rows[0]);
     if (!crm) throw notFound('Customer not found in this salon CRM');
+
+    // Consent check for STYLE_PHOTO_STORAGE
+    const consent = await one<{ is_granted: boolean }>(
+      `SELECT is_granted FROM customer_consents
+        WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+          AND (salon_id IS NULL OR salon_id = $2)
+        ORDER BY salon_id NULLS LAST LIMIT 1`,
+      [customerId, salonId],
+    );
+    const photoConsentGranted = Boolean(consent?.is_granted);
+
+    const referencePhotos: { key: string; url: string; expires_in: number }[] = [];
+    if (photoConsentGranted && Array.isArray(crm.reference_photo_s3_keys)) {
+      for (const key of crm.reference_photo_s3_keys) {
+        try {
+          const signed = presignGet({ key, expiresSec: 60 });
+          referencePhotos.push({ key, url: signed.url, expires_in: signed.expires_in });
+        } catch {
+          const pub = publicUrlFor(key);
+          if (pub) referencePhotos.push({ key, url: pub, expires_in: 60 });
+        }
+      }
+    }
+
     const visits = await query(
       `SELECT id, booking_code, status, scheduled_start_at, total_payable_paise
-         FROM bookings WHERE salon_id = $1 AND customer_id = $2 ORDER BY scheduled_start_at DESC LIMIT 20`,
+         FROM bookings WHERE salon_id = $1 AND customer_id = $2 ORDER BY scheduled_start_at DESC LIMIT 10`,
       [salonId, customerId],
     );
     const ledger = await query(
       `SELECT * FROM customer_value_ledger WHERE salon_id = $1 AND customer_id = $2 ORDER BY created_at DESC LIMIT 50`,
       [salonId, customerId],
     );
-    return { crm, visits, ledger };
-  });
+
+    return {
+      crm: {
+        ...crm,
+        photo_consent_granted: photoConsentGranted,
+        reference_photos: referencePhotos,
+      },
+      visits,
+      ledger,
+    };
+  };
+
+  app.get('/partner/crm/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomerDetailHandler);
+  app.get('/partner/salons/:id/customers/:cust_id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomerDetailHandler); // API-30
+
+  const updateStyleVaultHandler = async (req: any, reply: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
+    const customerId = req.params.cust_id ?? req.params.customerId;
+    const body = parse(StyleVaultInput, req.body);
+
+    const existing = await withTenant(salonId, (client) =>
+      client.query(
+        `SELECT * FROM salon_customer_crm WHERE salon_id = $1 AND customer_id = $2`,
+        [salonId, customerId],
+      ),
+    ).then((r) => r.rows[0]);
+    if (!existing) throw notFound('Customer not found in this salon CRM');
+
+    const consent = await one<{ is_granted: boolean }>(
+      `SELECT is_granted FROM customer_consents
+        WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+          AND (salon_id IS NULL OR salon_id = $2)
+        ORDER BY salon_id NULLS LAST LIMIT 1`,
+      [customerId, salonId],
+    );
+    const photoConsentGranted = Boolean(consent?.is_granted);
+
+    if ((body.request_photo_upload_count && body.request_photo_upload_count > 0) || body.uploaded_photo_keys?.length || body.reference_photo_s3_keys?.length) {
+      if (!photoConsentGranted) {
+        throw new AppError(403, 'CONSENT_REQUIRED', 'Customer has not consented to reference photo storage (STYLE_PHOTO_STORAGE)');
+      }
+    }
+
+    const uploadUrls: Array<{ upload_url: string; method: string; key: string; expires_in: number }> = [];
+    if (body.request_photo_upload_count && body.request_photo_upload_count > 0) {
+      for (let i = 0; i < body.request_photo_upload_count; i++) {
+        const key = buildObjectKey({ purpose: 'style-vault', userId: customerId, contentType: 'image/jpeg' });
+        if (storageConfigured()) {
+          const presigned = presignPut({ key, expiresSec: 900 });
+          uploadUrls.push(presigned);
+        } else {
+          uploadUrls.push({
+            upload_url: `/uploads/mock/${key}`,
+            method: 'PUT',
+            key,
+            expires_in: 900,
+          });
+        }
+      }
+    }
+
+    const stylePrefs = body.style_preferences ?? body.style_preferences_json;
+    const existingPhotos: string[] = Array.isArray(existing.reference_photo_s3_keys) ? existing.reference_photo_s3_keys : [];
+    const newPhotos = body.reference_photo_s3_keys ?? (
+      body.uploaded_photo_keys?.length
+        ? Array.from(new Set([...existingPhotos, ...body.uploaded_photo_keys]))
+        : undefined
+    );
+
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (body.preferred_staff_id !== undefined) {
+      params.push(body.preferred_staff_id);
+      sets.push(`preferred_staff_id = $${params.length}`);
+    }
+    if (body.preferred_service_ids !== undefined) {
+      params.push(body.preferred_service_ids);
+      sets.push(`preferred_service_ids = $${params.length}`);
+    }
+    if (stylePrefs !== undefined) {
+      params.push(JSON.stringify(stylePrefs));
+      sets.push(`style_preferences_json = $${params.length}`);
+    }
+    if (newPhotos !== undefined) {
+      params.push(newPhotos);
+      sets.push(`reference_photo_s3_keys = $${params.length}`);
+    }
+    sets.push(`updated_at = NOW()`);
+
+    params.push(salonId, customerId);
+    const updated = await withTenant(salonId, (client) =>
+      client.query(
+        `UPDATE salon_customer_crm SET ${sets.join(', ')}
+          WHERE salon_id = $${params.length - 1} AND customer_id = $${params.length} RETURNING *`,
+        params,
+      ),
+    ).then((r) => r.rows[0]);
+
+    const currentPhotos = Array.isArray(updated.reference_photo_s3_keys) ? updated.reference_photo_s3_keys : [];
+    const signedPhotos = photoConsentGranted
+      ? currentPhotos.map((k: string) => {
+          try {
+            return presignGet({ key: k, expiresSec: 60 });
+          } catch {
+            return { key: k, url: publicUrlFor(k) ?? '', expires_in: 60 };
+          }
+        })
+      : [];
+
+    reply.status(200);
+    return {
+      style_vault: {
+        ...updated,
+        photo_consent_granted: photoConsentGranted,
+        reference_photos: signedPhotos,
+      },
+      upload_urls: uploadUrls,
+    };
+  };
+
+  app.put('/partner/salons/:id/customers/:cust_id/style-vault', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, updateStyleVaultHandler); // API-31
+  app.put('/partner/crm/:customerId/style-vault', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, updateStyleVaultHandler);
+  app.patch('/partner/crm/:customerId/style-vault', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, updateStyleVaultHandler);
 
   app.patch('/partner/crm/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
@@ -984,6 +1158,19 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       }),
       req.body,
     );
+
+    if (body.reference_photo_s3_keys?.length) {
+      const consent = await one<{ is_granted: boolean }>(
+        `SELECT is_granted FROM customer_consents
+          WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+            AND (salon_id IS NULL OR salon_id = $2)
+          ORDER BY salon_id NULLS LAST LIMIT 1`,
+        [customerId, salonId],
+      );
+      if (!consent || !consent.is_granted) {
+        throw new AppError(403, 'CONSENT_REQUIRED', 'Customer has not consented to reference photo storage (STYLE_PHOTO_STORAGE)');
+      }
+    }
 
     const map: [string, unknown][] = [
       ['preferred_staff_id', body.preferred_staff_id],

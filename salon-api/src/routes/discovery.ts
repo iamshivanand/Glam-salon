@@ -154,7 +154,7 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
     );
 
     rows.sort((a, b) => (a.match_rank - b.match_rank) || (a.priority_rank - b.priority_rank));
-    return { addons: rows };
+    return { addons: rows, recommendations: rows };
   };
 
   app.get('/salons/:id/addons/recommend', handleAddonRecommendations); // API-14

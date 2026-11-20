@@ -540,6 +540,8 @@ export interface CrmCustomer {
   customer_name: string;
   custom_customer_code: string;
   preferred_staff_id: string | null;
+  preferred_staff_name?: string | null;
+  preferred_service_ids?: string[];
   total_visits: number;
   total_spend_paise: number;
   avg_bill_paise: number;
@@ -548,6 +550,10 @@ export interface CrmCustomer {
   last_visit_at: string;
   next_expected_visit_date: string | null;
   loyalty_points_balance: number;
+  style_preferences_json?: Record<string, any>;
+  reference_photo_s3_keys?: string[];
+  reference_photos?: { key: string; url: string; expires_in: number }[];
+  photo_consent_granted?: boolean;
 }
 
 export function usePartnerCrm(enabled = true) {
@@ -587,6 +593,52 @@ export function useUpdateCrm() {
       qc.invalidateQueries({ queryKey: qk.partnerCrm });
       qc.invalidateQueries({ queryKey: qk.partnerCrmDetail(vars.customerId) });
     },
+  });
+}
+
+export function useUpdateStyleVault() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      customerId,
+      ...body
+    }: {
+      customerId: string;
+      preferred_staff_id?: string | null;
+      preferred_service_ids?: string[];
+      style_preferences?: Record<string, any>;
+      request_photo_upload_count?: number;
+      uploaded_photo_keys?: string[];
+    }) =>
+      api<{
+        style_vault: CrmCustomer;
+        upload_urls: { upload_url: string; method: string; key: string; expires_in: number }[];
+      }>(`/partner/crm/${customerId}/style-vault`, { method: 'PUT', body }),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.partnerCrm });
+      qc.invalidateQueries({ queryKey: qk.partnerCrmDetail(vars.customerId) });
+    },
+  });
+}
+
+export interface CustomerStyleVaultItem {
+  salon_id: string;
+  salon_name: string;
+  locality: string;
+  preferred_staff_id: string | null;
+  preferred_staff_name: string | null;
+  style_preferences_json: Record<string, any>;
+  reference_photos: { key: string; url: string }[];
+  last_visit_at: string;
+  total_visits: number;
+  photo_consent_granted: boolean;
+}
+
+export function useCustomerStyleVault(enabled = true) {
+  return useQuery({
+    queryKey: ['users', 'style-vault'],
+    queryFn: () => api<{ vaults: CustomerStyleVaultItem[]; photo_consent_granted: boolean }>('/users/me/style-vault'),
+    enabled,
   });
 }
 

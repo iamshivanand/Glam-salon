@@ -22,6 +22,9 @@ ALTER TABLE salon_customer_crm ENABLE ROW LEVEL SECURITY;
 ALTER TABLE salon_customer_crm FORCE ROW LEVEL SECURITY;
 CREATE POLICY salon_crm_tenant_isolation ON salon_customer_crm
   USING (salon_id = NULLIF(current_setting('app.current_salon_id', true), '')::UUID);
+CREATE POLICY customer_crm_self_read ON salon_customer_crm
+  FOR SELECT
+  USING (customer_id = NULLIF(current_setting('app.current_user_id', true), '')::UUID);
 
 -- Retention reminders are tenant-scoped too
 ALTER TABLE retention_reminders ENABLE ROW LEVEL SECURITY;

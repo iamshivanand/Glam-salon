@@ -148,3 +148,71 @@ export function publicUrlFor(key: string): string | null {
   if (!env.S3_PUBLIC_BASE_URL) return null;
   return `${env.S3_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key.replace(/^\/+/, '')}`;
 }
+
+/**
+ * Create a short-lived presigned GET URL for reading private S3 objects.
+ */
+export function presignGet(opts: { key: string; expiresSec?: number }): {
+  url: string;
+  key: string;
+  expires_in: number;
+} {
+  const expiresIn = Math.min(Math.max(opts.expiresSec ?? 60, 10), 3600);
+  if (!storageConfigured()) {
+    return {
+      url: publicUrlFor(opts.key) ?? `/uploads/mock/${opts.key.replace(/^\/+/, '')}`,
+      key: opts.key,
+      expires_in: expiresIn,
+    };
+  }
+
+  const { protocol, host, pathStyle } = storageEndpoint();
+  const key = opts.key.replace(/^\/+/, '');
+  const canonicalUri = pathStyle
+    ? `/${encodeRfc3986(env.S3_BUCKET!)}/${key.split('/').map(encodeRfc3986).join('/')}`
+    : `/${key.split('/').map(encodeRfc3986).join('/')}`;
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const scope = `${dateStamp}/${env.S3_REGION}/s3/aws4_request`;
+
+  const query = new URLSearchParams({
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${env.S3_ACCESS_KEY_ID}/${scope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresIn),
+    'X-Amz-SignedHeaders': 'host',
+  });
+  const canonicalQuery = query.toString().replace(/\+/g, '%20');
+
+  const canonicalRequest = [
+    'GET',
+    canonicalUri,
+    canonicalQuery,
+    `host:${host}\n`,
+    'host',
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    scope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+
+  const kDate = hmac(`AWS4${env.S3_SECRET_ACCESS_KEY}`, dateStamp);
+  const kRegion = hmac(kDate, env.S3_REGION);
+  const kService = hmac(kRegion, 's3');
+  const kSigning = hmac(kService, 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+
+  const getUrl = `${protocol}//${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+
+  return {
+    url: getUrl,
+    key,
+    expires_in: expiresIn,
+  };
+}

@@ -8,6 +8,7 @@ import {
   useAddAddress,
   useAddresses,
   useConsents,
+  useCustomerStyleVault,
   useDeleteAddress,
   useDeleteAccount,
   useMe,
@@ -43,6 +44,7 @@ export default function AccountPage() {
   const setAvatar = useSetAvatar();
   const uploadStatus = useUploadStatus();
   const payments = usePayments(!!user);
+  const styleVault = useCustomerStyleVault(!!user);
 
   const [form, setForm] = useState({ full_name: '', email: '', gender: '', date_of_birth: '' });
   const [address, setAddress] = useState({
@@ -332,6 +334,105 @@ export default function AccountPage() {
         <p className="text-[11px] opacity-50">
           Replying STOP to a WhatsApp or SMS reminder opts you out across salons immediately.
         </p>
+      </section>
+
+      <section className="card p-6 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="font-semibold flex items-center gap-2">
+              <span>✂️</span> My Haircut & Style Preferences Vault
+            </h2>
+            <p className="text-xs opacity-60 mt-0.5">
+              Your saved cut notes, guard numbers, and beard preferences recorded across salons.
+            </p>
+          </div>
+          {styleVault.data?.photo_consent_granted ? (
+            <span className="text-[10px] text-green-700 bg-green-50 px-2 py-0.5 rounded-full border border-green-200">
+              ✓ Photo Storage Consented
+            </span>
+          ) : (
+            <span className="text-[10px] text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+              🔒 Enable in Communication Choices
+            </span>
+          )}
+        </div>
+
+        {styleVault.isLoading && <p className="text-sm opacity-60">Loading your style profile…</p>}
+
+        <div className="space-y-3">
+          {(styleVault.data?.vaults ?? []).map((v) => {
+            const prefs = (v.style_preferences_json ?? {}) as Record<string, any>;
+            const hasPrefs = Boolean(prefs.haircut || prefs.beard || prefs.guard_size || prefs.notes || Object.keys(prefs).length > 0);
+            return (
+              <div key={v.salon_id} className="border border-line rounded-2xl p-4 bg-surface-raised/30 space-y-2">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <p className="font-semibold text-sm">{v.salon_name}</p>
+                    <p className="text-[11px] opacity-60">
+                      {v.locality} · {v.total_visits} {v.total_visits === 1 ? 'visit' : 'visits'} · Last visit {new Date(v.last_visit_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
+                    </p>
+                  </div>
+                  {v.preferred_staff_name && (
+                    <span className="text-[11px] px-2.5 py-1 rounded-full border border-line bg-background">
+                      Stylist: <b>{v.preferred_staff_name}</b>
+                    </span>
+                  )}
+                </div>
+
+                {hasPrefs ? (
+                  <div className="grid sm:grid-cols-2 md:grid-cols-4 gap-2 pt-2 text-xs">
+                    {prefs.haircut && (
+                      <div className="rounded-xl border border-line/60 bg-background/50 p-2.5">
+                        <span className="text-[10px] uppercase tracking-wider opacity-50 block">Haircut Style</span>
+                        <span className="font-medium mt-0.5 block">{prefs.haircut}</span>
+                      </div>
+                    )}
+                    {prefs.beard && (
+                      <div className="rounded-xl border border-line/60 bg-background/50 p-2.5">
+                        <span className="text-[10px] uppercase tracking-wider opacity-50 block">Beard Style</span>
+                        <span className="font-medium mt-0.5 block">{prefs.beard}</span>
+                      </div>
+                    )}
+                    {prefs.guard_size && (
+                      <div className="rounded-xl border border-line/60 bg-background/50 p-2.5">
+                        <span className="text-[10px] uppercase tracking-wider opacity-50 block">Guard / Blade</span>
+                        <span className="font-medium mt-0.5 block">{prefs.guard_size}</span>
+                      </div>
+                    )}
+                    {prefs.notes && (
+                      <div className="rounded-xl border border-line/60 bg-background/50 p-2.5 sm:col-span-2 md:col-span-1">
+                        <span className="text-[10px] uppercase tracking-wider opacity-50 block">Stylist Notes</span>
+                        <span className="font-medium mt-0.5 block truncate" title={prefs.notes}>{prefs.notes}</span>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs opacity-50 italic py-1">No custom style notes recorded yet for this salon.</p>
+                )}
+
+                {v.reference_photos?.length > 0 && (
+                  <div className="pt-2 border-t border-line/40">
+                    <p className="text-[10px] uppercase tracking-wider opacity-50 mb-1.5">Reference Photographs</p>
+                    <div className="flex gap-2 flex-wrap">
+                      {v.reference_photos.map((photo, pIdx) => (
+                        <div key={photo.key || pIdx} className="w-16 h-16 rounded-xl overflow-hidden border border-line">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img src={photo.url} alt={`Style photo ${pIdx + 1}`} className="w-full h-full object-cover" />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {!styleVault.isLoading && (!styleVault.data?.vaults || styleVault.data.vaults.length === 0) && (
+            <p className="text-sm opacity-60 py-2">
+              No style preferences recorded yet. Once you complete visits at partner salons, your cut specifications and preferred stylists will appear here.
+            </p>
+          )}
+        </div>
       </section>
 
       <section className="card p-6 space-y-3">
