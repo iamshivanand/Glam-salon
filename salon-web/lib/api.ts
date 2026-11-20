@@ -278,11 +278,19 @@ export interface MyBooking {
   scheduled_start_at: string;
   scheduled_end_at: string;
   total_payable_paise: number;
+  subtotal_paise?: number;
+  tax_paise?: number;
   salon_name: string;
   locality: string;
   city: string;
   checkin_pin?: string;
   review_id?: string | null;
+  items?: {
+    id: string;
+    service_name: string;
+    status: string;
+    unit_price_paise: number;
+  }[];
 }
 
 export interface PartnerBooking {
@@ -311,6 +319,36 @@ export function useSalonSearch(params: { lat?: number; lng?: number; radius_km?:
   return useQuery({
     queryKey: qk.salons(params),
     queryFn: () => api<SearchResponse>(`/discovery/search${qs({ ...params, page_size: 12 })}`),
+    staleTime: 60_000,
+  });
+}
+
+export interface UrgentSlotMatch {
+  salon_id: string;
+  salon_name: string;
+  distance_km: number | null;
+  travel_eta_mins: number;
+  earliest_slot_start: string;
+  starts_in_mins: number;
+  staff_id: string;
+  staff_name: string | null;
+  price_paise: number;
+  flash_deal_discount_paise: number;
+  instant_confirm_guaranteed: boolean;
+}
+
+export function useUrgentSlots(params: {
+  lat?: number;
+  lng?: number;
+  radius_km?: number;
+  category_id?: string;
+  within_mins?: number;
+}) {
+  return useQuery({
+    queryKey: ['urgent-slots', params],
+    queryFn: () => api<{ urgent_matches: UrgentSlotMatch[] }>(`/discovery/urgent-slots${qs(params)}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
   });
 }
 
@@ -319,6 +357,7 @@ export function useSalon(id?: string) {
     queryKey: qk.salon(id),
     queryFn: () => api<SalonProfile>(`/salons/${id}`),
     enabled: !!id,
+    staleTime: 60_000,
   });
 }
 
@@ -394,7 +433,7 @@ export function useHold() {
 export function useCreateBooking() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: { hold_token: string; customer_notes?: string; reminder_token?: string }) =>
+    mutationFn: (body: { hold_token: string; customer_notes?: string; reminder_token?: string; payment_mode?: string }) =>
       api<{ id: string; booking_code: string; status: string; checkin_pin: string; scheduled_start_at: string; total_payable_paise: number }>(
         '/bookings',
         { method: 'POST', body, key: crypto.randomUUID() },
@@ -408,8 +447,13 @@ export function useCreateBooking() {
 export function useCancelBooking() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
-      api(`/bookings/${id}/cancel`, { method: 'POST', body: { reason } }),
+    mutationFn: ({ id, reason, cancel_item_ids }: { id: string; reason?: string; cancel_item_ids?: string[] }) =>
+      api<{
+        status: string;
+        cancellation_fee_paise: number;
+        refund_due_paise: number;
+        refunded_paise?: number;
+      }>(`/bookings/${id}/cancel`, { method: 'POST', body: { reason, cancel_item_ids } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.myBookings }),
   });
 }
@@ -629,6 +673,88 @@ export function usePartnerQueue(enabled = true) {
     queryKey: qk.partnerQueue,
     queryFn: () => api<{ now_serving_token: number | null; waiting_count: number; queue: any[]; walkin_paused: boolean }>('/partner/queue'),
     enabled,
+  });
+}
+
+export function useLiveQueue(salonId: string, enabled = true) {
+  return useQuery({
+    queryKey: ['queue', 'live', salonId],
+    queryFn: () =>
+      api<{
+        walkin_paused: boolean;
+        now_serving_token: number | null;
+        waiting_count: number;
+        queue: {
+          token_number: number;
+          customer_name: string;
+          status: string;
+          estimated_wait_mins: number;
+        }[];
+      }>(`/queue/${salonId}/live`),
+    enabled: enabled && !!salonId,
+    refetchInterval: 10_000,
+  });
+}
+
+export function useQueueToken(salonId: string, tokenId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ['queue', 'token', salonId, tokenId],
+    queryFn: () =>
+      api<{
+        token_id: string;
+        token_number: number;
+        status: string;
+        customer_name: string;
+        queue_date: string;
+        people_ahead: number;
+        estimated_wait_mins: number;
+        assigned_staff_id?: string;
+        assigned_resource_id?: string;
+        total_duration_mins: number;
+        joined_at: string;
+        called_at?: string;
+        service_started_at?: string;
+        completed_at?: string;
+      }>(`/queue/${salonId}/tokens/${tokenId}`),
+    enabled: enabled && !!salonId && !!tokenId,
+    refetchInterval: 5_000,
+  });
+}
+
+export function useJoinQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      salon_id: string;
+      customer_name?: string;
+      phone?: string;
+      service_ids: string[];
+      preferred_staff_id?: string;
+    }) =>
+      api<{
+        token_id: string;
+        token_number: number;
+        status: string;
+        people_ahead: number;
+        estimated_wait_mins: number;
+        is_estimate_disclaimer?: boolean;
+      }>('/queue/join', { method: 'POST', body }),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['queue', 'live', vars.salon_id] });
+      qc.invalidateQueries({ queryKey: ['salons'] });
+    },
+  });
+}
+
+export function useLeaveQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ salonId, tokenId }: { salonId: string; tokenId: string }) =>
+      api(`/queue/${salonId}/tokens/${tokenId}`, { method: 'PATCH', body: { status: 'LEFT_QUEUE' } }),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['queue', 'live', vars.salonId] });
+      qc.invalidateQueries({ queryKey: ['queue', 'token', vars.salonId, vars.tokenId] });
+    },
   });
 }
 

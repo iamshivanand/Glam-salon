@@ -73,7 +73,10 @@ export async function buildApp() {
     }
     req.log.error({ err }, 'unhandled error');
     return reply.status(500).send({
-      error: { code: 'INTERNAL_ERROR', message: 'Something went wrong on our side.' },
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: isDev && err?.message ? err.message : 'Something went wrong on our side.',
+      },
     });
   });
 

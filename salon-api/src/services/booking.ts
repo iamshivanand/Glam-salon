@@ -112,11 +112,13 @@ export async function holdBooking(opts: {
   const { match } = await assertSlotAvailable(opts.salonId, opts.serviceIds, opts.startAt, opts.staffId);
 
   const subtotal = services.reduce((sum, s) => sum + priceOf(s), 0);
+  const GST_RATE = 0.18;
+  const tax_paise = Math.round(subtotal * GST_RATE);
   const pricing = {
     subtotal_paise: subtotal,
     discount_paise: 0,
-    tax_paise: 0,
-    total_payable_paise: subtotal,
+    tax_paise,
+    total_payable_paise: subtotal + tax_paise,
   };
 
   const base: Omit<HoldPayload, 'lock_keys' | 'hold_token'> = {
@@ -166,6 +168,32 @@ export async function createBooking(opts: {
   reminderToken?: string;
   attributionChannel?: string | null;
 }): Promise<any> {
+  const existing = await one<{
+    id: string;
+    booking_code: string;
+    status: string;
+    checkin_pin: string;
+    scheduled_start_at: string;
+    scheduled_end_at: string;
+    total_payable_paise: number;
+  }>(
+    `SELECT id, booking_code, status, checkin_pin, scheduled_start_at, scheduled_end_at, total_payable_paise
+       FROM bookings
+      WHERE idempotency_key = $1 AND customer_id = $2`,
+    [opts.idempotencyKey, opts.customerId],
+  );
+  if (existing) {
+    return {
+      id: existing.id,
+      booking_code: existing.booking_code,
+      status: existing.status,
+      checkin_pin: existing.checkin_pin,
+      scheduled_start_at: existing.scheduled_start_at,
+      scheduled_end_at: existing.scheduled_end_at,
+      total_payable_paise: existing.total_payable_paise,
+    };
+  }
+
   const hold = await getHold(opts.holdToken);
   if (hold.customer_id !== opts.customerId) throw forbidden('This hold belongs to another customer');
 
@@ -401,10 +429,33 @@ export async function cancelBooking(opts: {
   }
   const partial = Array.isArray(opts.cancelItemIds) && opts.cancelItemIds.length > 0;
 
+  // Policy calculation
+  const now = Date.now();
+  const scheduledStart = new Date(booking.scheduled_start_at).getTime();
+  const diffHours = (scheduledStart - now) / (3600 * 1000);
+
+  // Cancellation policy: Free if > 2 hours prior; 50% fee if within 2 hours.
+  // Salons cancelling on customer receive 0% fee / full refund.
+  let feeRate = 0;
+  if (opts.auth.role === 'CUSTOMER') {
+    feeRate = diffHours >= 2 ? 0 : 0.50;
+  }
+
   const result = await tx(async (client) => {
     await client.query('SELECT set_config($1, $2, true)', ['app.current_salon_id', booking.salon_id]);
 
+    let targetAmountPaise = Number(booking.total_payable_paise);
+
     if (partial) {
+      const cancelledItems = await client.query<{ unit_price_paise: number }>(
+        `SELECT unit_price_paise FROM booking_items
+          WHERE booking_id = $1 AND id = ANY($2::uuid[]) AND status NOT IN ('CANCELLED_BY_CUSTOMER','CANCELLED_BY_SALON')`,
+        [opts.bookingId, opts.cancelItemIds],
+      );
+      const cancelledSubtotal = cancelledItems.rows.reduce((sum, r) => sum + Number(r.unit_price_paise), 0);
+      const cancelledTax = Math.round(cancelledSubtotal * 0.18);
+      targetAmountPaise = cancelledSubtotal + cancelledTax;
+
       await client.query(
         `UPDATE booking_items SET status = 'CANCELLED_BY_CUSTOMER'
           WHERE booking_id = $1 AND id = ANY($2::uuid[])`,
@@ -421,10 +472,13 @@ export async function cancelBooking(opts: {
           opts.reason ?? null,
         ]);
       } else {
-        await client.query(`UPDATE bookings SET subtotal_paise = $2, total_payable_paise = $2 WHERE id = $1`, [
-          opts.bookingId,
-          remaining.rows[0].total,
-        ]);
+        const remainingSubtotal = Number(remaining.rows[0].total);
+        const remainingTax = Math.round(remainingSubtotal * 0.18);
+        const remainingTotal = remainingSubtotal + remainingTax;
+        await client.query(
+          `UPDATE bookings SET subtotal_paise = $2, tax_paise = $3, total_payable_paise = $4 WHERE id = $1`,
+          [opts.bookingId, remainingSubtotal, remainingTax, remainingTotal],
+        );
       }
     } else {
       await client.query(`UPDATE booking_items SET status = 'CANCELLED_BY_CUSTOMER' WHERE booking_id = $1`, [opts.bookingId]);
@@ -434,10 +488,39 @@ export async function cancelBooking(opts: {
       );
     }
 
+    const cancellationFeePaise = Math.round(targetAmountPaise * feeRate);
+    const refundDuePaise = targetAmountPaise - cancellationFeePaise;
+
+    // Check for paid online orders and auto-refund
+    let refundedPaise = 0;
+    const paidOrder = (
+      await client.query<{ id: string; amount_paise: number }>(
+        `SELECT id, amount_paise FROM payment_orders WHERE booking_id = $1 AND status = 'PAID' ORDER BY created_at DESC LIMIT 1`,
+        [opts.bookingId],
+      )
+    ).rows[0];
+
+    if (paidOrder && refundDuePaise > 0) {
+      const refundAmount = Math.min(refundDuePaise, Number(paidOrder.amount_paise));
+      try {
+        const { refundPayment } = await import('./payments.js');
+        await refundPayment({
+          salonId: booking.salon_id,
+          paymentId: paidOrder.id,
+          amountPaise: refundAmount,
+          reason: opts.reason ?? (feeRate > 0 ? 'Late cancellation partial refund' : 'Booking cancellation full refund'),
+          actorId: opts.auth.id,
+        });
+        refundedPaise = refundAmount;
+      } catch {
+        // Payment provider may not be configured in mock/offline mode, still record refund due
+      }
+    }
+
     await client.query(
       `INSERT INTO booking_audit_logs
-         (booking_id, actor_user_id, actor_role, previous_status, new_status, change_reason)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
+         (booking_id, actor_user_id, actor_role, previous_status, new_status, change_reason, metadata_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
       [
         opts.bookingId,
         opts.auth.id,
@@ -445,13 +528,23 @@ export async function cancelBooking(opts: {
         booking.status,
         partial ? booking.status : 'CANCELLED_BY_CUSTOMER',
         opts.reason ?? 'cancelled',
+        JSON.stringify({
+          partial,
+          cancelled_item_ids: opts.cancelItemIds ?? [],
+          cancellation_fee_paise: cancellationFeePaise,
+          refund_due_paise: refundDuePaise,
+          refunded_paise: refundedPaise,
+          hours_prior: Math.max(0, Number(diffHours.toFixed(2))),
+        }),
       ],
     );
 
     return {
       status: partial ? booking.status : 'CANCELLED_BY_CUSTOMER',
-      cancellation_fee_paise: 0,
-      refund_due_paise: 0,
+      cancellation_fee_paise: cancellationFeePaise,
+      refund_due_paise: refundDuePaise,
+      refunded_paise: refundedPaise,
+      cancelled_item_ids: opts.cancelItemIds ?? [],
     };
   });
 
@@ -486,8 +579,10 @@ export async function updateBookingStatus(opts: {
   if (!allowed.includes(opts.status)) {
     throw badRequest('INVALID_TRANSITION', `Cannot move ${booking.status} -> ${opts.status}`);
   }
-  if (opts.status === 'ARRIVED' && opts.checkinPin && opts.checkinPin !== booking.checkin_pin) {
-    throw badRequest('INVALID_CHECKIN_PIN', 'The check-in PIN does not match');
+  if (opts.status === 'ARRIVED') {
+    if (!opts.checkinPin || opts.checkinPin !== booking.checkin_pin) {
+      throw badRequest('INVALID_CHECKIN_PIN', 'A valid 4-digit check-in PIN is required for arrival check-in');
+    }
   }
 
   const updated = await tx(async (client) => {
@@ -585,4 +680,40 @@ export async function createReview(opts: {
   }
 
   return review;
+}
+
+export async function expireStaleBookings(): Promise<number> {
+  try {
+    const expired = await tx(async (client) => {
+      const rows = await client.query<{ id: string; customer_id: string }>(
+        `UPDATE bookings
+            SET status = 'EXPIRED'
+          WHERE status = 'REQUESTED'
+            AND approval_expires_at IS NOT NULL
+            AND approval_expires_at < NOW()
+          RETURNING id, customer_id`,
+      );
+      if (!rows.rows.length) return 0;
+      const ids = rows.rows.map((r) => r.id);
+      await client.query(
+        `UPDATE booking_items
+            SET status = 'EXPIRED'
+          WHERE booking_id = ANY($1::uuid[])`,
+        [ids],
+      );
+      for (const row of rows.rows) {
+        await client.query(
+          `INSERT INTO booking_audit_logs
+             (booking_id, actor_user_id, actor_role, previous_status, new_status, change_reason, metadata_json)
+           VALUES ($1, $2, 'PLATFORM_ADMIN', 'REQUESTED', 'EXPIRED', 'approval_timeout', '{"automated": true}'::jsonb)`,
+          [row.id, row.customer_id],
+        );
+      }
+      return rows.rows.length;
+    });
+    return expired;
+  } catch (err: any) {
+    console.error('[expireStaleBookings] error:', err?.message);
+    return 0;
+  }
 }

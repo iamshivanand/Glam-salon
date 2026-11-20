@@ -13,6 +13,7 @@ import { reminderFunnel } from '../services/engagement.js';
 import { listPaymentsForSalon, refundPayment, settlementsForSalon } from '../services/payments.js';
 import { fmtLocalDate } from '../services/availability.js';
 import { invalidateSalonProfileCache } from '../services/discovery.js';
+import { updateBookingStatus } from '../services/booking.js';
 
 const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
@@ -630,6 +631,32 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     );
     return { ...booking, items, customer, audit };
   });
+
+  // API-28 – Update partner booking status
+  app.patch(
+    '/partner/bookings/:id/status',
+    { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] },
+    async (req) => {
+      const salonId = await resolveSalonId(req);
+      const { id } = req.params as { id: string };
+      const body = parse(
+        z.object({
+          status: z.enum(['CONFIRMED', 'DECLINED', 'ARRIVED', 'IN_SERVICE', 'COMPLETED', 'NO_SHOW', 'CANCELLED_BY_SALON']),
+          checkin_pin: z.string().regex(/^\d{4}$/).optional(),
+        }),
+        req.body,
+      );
+      const b = await one(`SELECT id FROM bookings WHERE id = $1 AND salon_id = $2`, [id, salonId]);
+      if (!b) throw notFound('Booking not found for this salon');
+
+      return updateBookingStatus({
+        bookingId: id,
+        auth: req.auth!,
+        status: body.status,
+        checkinPin: body.checkin_pin,
+      });
+    },
+  );
 
   // ---------- Dashboard ----------
   app.get('/partner/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {

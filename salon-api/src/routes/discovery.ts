@@ -37,9 +37,9 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
     const page = pagination(req.query as Record<string, unknown>);
     const priceTier = q.price_tier
       ? q.price_tier
-          .split(',')
-          .map((v) => Number(v))
-          .filter((v) => Number.isFinite(v))
+        .split(',')
+        .map((v) => Number(v))
+        .filter((v) => Number.isFinite(v))
       : undefined;
 
     return searchSalons({
@@ -60,7 +60,7 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
   app.get('/discovery/search', handleSearch);
   app.get('/discovery/salons', handleSearch); // API-09 blueprint route alias
 
-  app.get('/discovery/urgent', async (req) => {
+  const handleUrgent = async (req: any) => {
     const q = parse(
       z.object({
         lat: z.coerce.number().optional(),
@@ -78,7 +78,10 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
       categoryId: q.category_id,
       withinMins: q.within_mins,
     });
-  });
+  };
+
+  app.get('/discovery/urgent', handleUrgent);
+  app.get('/discovery/urgent-slots', handleUrgent); // API-10 blueprint route alias
 
   app.get('/discovery/compare', async (req) => {
     const q = parse(
@@ -147,11 +150,5 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
       [id],
     );
     return { stats, reviews };
-  });
-
-  app.get('/salons/:id/queue', async (req) => {
-    const { id } = req.params as { id: string };
-    const { liveQueue } = await import('../services/queue.js');
-    return liveQueue(id);
   });
 };

@@ -79,7 +79,9 @@ export default function BookPage() {
     () => (profile?.services ?? []).filter((s) => b.serviceIds.includes(s.id)),
     [profile, b.serviceIds],
   );
-  const total = selected.reduce((sum, s) => sum + (s.discounted_price_paise ?? s.base_price_paise), 0);
+  const subtotal = selected.reduce((sum, s) => sum + (s.discounted_price_paise ?? s.base_price_paise), 0);
+  const taxes = Math.round(subtotal * 0.18);
+  const total = subtotal + taxes;
   // With "Anyone" selected the API returns one slot per available artist, which
   // shows the same time twice. Collapse to unique start times; picking an artist
   // narrows the response to that artist anyway.
@@ -106,7 +108,11 @@ export default function BookPage() {
         staff_id: slot.staff_id,
         start_at: slot.start_at,
       });
-      const booking = await create.mutateAsync({ hold_token: held.hold_token, reminder_token: reminderToken });
+      const booking = await create.mutateAsync({
+        hold_token: held.hold_token,
+        reminder_token: reminderToken,
+        payment_mode: payMode,
+      });
       setConfirmation(booking);
       if (payMode === 'PAY_ONLINE') {
         try {
@@ -309,7 +315,15 @@ export default function BookPage() {
                 <span>{rupees(s.discounted_price_paise ?? s.base_price_paise)}</span>
               </div>
             ))}
-            <div className="flex justify-between font-semibold border-t border-line pt-2 mt-2">
+            <div className="flex justify-between text-xs opacity-70 border-t border-line pt-2 mt-2">
+              <span>Subtotal</span>
+              <span>{rupees(subtotal)}</span>
+            </div>
+            <div className="flex justify-between text-xs opacity-70">
+              <span>Estimated Taxes (18% GST)</span>
+              <span>{rupees(taxes)}</span>
+            </div>
+            <div className="flex justify-between font-semibold border-t border-line pt-1 mt-1">
               <span>Total</span>
               <span>{rupees(total)}</span>
             </div>

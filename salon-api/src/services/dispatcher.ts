@@ -9,6 +9,7 @@ import {
   type Notifier,
 } from './notifications.js';
 import { renderReminderMessage } from './rendering.js';
+import { expireStaleBookings } from './booking.js';
 
 export interface DispatchLog {
   info: (obj: object, msg?: string) => void;
@@ -314,6 +315,7 @@ export function startReminderDispatcher(log: DispatchLog, intervalSec = env.REMI
     if (running) return;
     running = true;
     try {
+      await expireStaleBookings().catch((err) => log.error({ error: logError(err) }, 'expireStaleBookings failed'));
       const result = await dispatchReminders({ limit: 50, log });
       if (result.due) log.info(result, 'reminder dispatcher tick');
     } catch (err) {

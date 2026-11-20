@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { useCancelBooking, useMyBookings, useSubmitReview, rupees } from '@/lib/api';
+import { useCancelBooking, useMyBookings, useSubmitReview, rupees, type MyBooking } from '@/lib/api';
 import { useAuth, useAuthModal } from '@/lib/store';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -59,7 +59,7 @@ function ReviewForm({ bookingId }: { bookingId: string }) {
         className="w-full border border-line rounded-xl px-3 py-2 bg-transparent text-sm"
       />
       {problem && <p className="text-xs text-red-600">{problem}</p>}
-      <div className="flex gap-2">
+      <div className="flex items-center gap-3">
         <button
           onClick={async () => {
             setProblem(null);
@@ -85,11 +85,138 @@ function ReviewForm({ bookingId }: { bookingId: string }) {
   );
 }
 
+function CancelModal({
+  booking,
+  onClose,
+}: {
+  booking: MyBooking;
+  onClose: () => void;
+}) {
+  const cancel = useCancelBooking();
+  const [reason, setReason] = useState('Change of schedule');
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const activeItems = (booking.items ?? []).filter((i) => i.status !== 'CANCELLED_BY_CUSTOMER' && i.status !== 'CANCELLED_BY_SALON');
+  const hasMultipleItems = activeItems.length > 1;
+
+  const now = Date.now();
+  const scheduledStart = new Date(booking.scheduled_start_at).getTime();
+  const hoursUntil = (scheduledStart - now) / (3600 * 1000);
+  const isLate = hoursUntil < 2;
+
+  const handleToggleItem = (id: string) => {
+    setSelectedItemIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const handleConfirmCancel = async () => {
+    setError(null);
+    try {
+      const isPartial = hasMultipleItems && selectedItemIds.length > 0 && selectedItemIds.length < activeItems.length;
+      await cancel.mutateAsync({
+        id: booking.id,
+        reason,
+        cancel_item_ids: isPartial ? selectedItemIds : undefined,
+      });
+      onClose();
+    } catch (err: any) {
+      setError(err?.message || 'Failed to cancel appointment');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="bg-surface border border-line rounded-3xl p-6 sm:p-7 max-w-md w-full shadow-2xl relative">
+        <button onClick={onClose} className="absolute top-4 right-4 text-xl opacity-60 hover:opacity-100 transition">
+          &times;
+        </button>
+
+        <h3 className="font-display text-2xl font-bold">Cancel Appointment</h3>
+        <p className="text-xs opacity-70 mt-1">Booking {booking.booking_code} · {booking.salon_name}</p>
+
+        {/* Cancellation policy banner */}
+        <div className={`mt-4 p-3.5 rounded-2xl text-xs border ${
+          isLate ? 'bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300' : 'bg-accent/10 border-accent/30 text-foreground'
+        }`}>
+          <p className="font-semibold">{isLate ? 'Late cancellation (within 2 hours)' : 'Standard cancellation (> 2 hours)'}</p>
+          <p className="mt-0.5 opacity-90">
+            {isLate
+              ? 'Appointments cancelled less than 2 hours in advance are subject to a 50% cancellation fee. Any remaining 50% is refunded.'
+              : 'Free cancellation. 100% of applicable paid amounts are refunded immediately to your original payment method.'}
+          </p>
+        </div>
+
+        {/* Partial cancellation item selector */}
+        {hasMultipleItems && (
+          <div className="mt-4">
+            <label className="block text-xs font-medium opacity-70 mb-1.5">
+              Select services to cancel (leave empty to cancel all):
+            </label>
+            <div className="space-y-1.5 border border-line rounded-2xl p-2.5 max-h-36 overflow-y-auto">
+              {activeItems.map((item) => {
+                const checked = selectedItemIds.includes(item.id);
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => handleToggleItem(item.id)}
+                    className={`w-full flex items-center justify-between p-2 rounded-xl text-left text-xs transition border ${
+                      checked
+                        ? 'bg-accent/15 border-accent text-foreground font-medium'
+                        : 'border-transparent hover:bg-surface-raised opacity-80'
+                    }`}
+                  >
+                    <span className="truncate pr-2">{item.service_name}</span>
+                    <span className="whitespace-nowrap font-mono">{rupees(item.unit_price_paise)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="mt-4">
+          <label className="block text-xs font-medium opacity-70 mb-1">Reason for cancellation</label>
+          <input
+            type="text"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. Schedule conflict"
+            className="w-full border border-line rounded-xl px-3 py-2 bg-transparent text-xs"
+          />
+        </div>
+
+        {error && <p className="text-xs text-red-600 dark:text-red-400 mt-2">{error}</p>}
+
+        <div className="mt-5 flex gap-2.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex-1 py-2 rounded-full border border-line text-xs font-medium opacity-75 hover:opacity-100 transition"
+          >
+            Keep appointment
+          </button>
+          <button
+            type="button"
+            onClick={handleConfirmCancel}
+            disabled={cancel.isPending}
+            className="flex-1 py-2 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-semibold disabled:opacity-50 transition"
+          >
+            {cancel.isPending ? 'Processing…' : hasMultipleItems && selectedItemIds.length > 0 && selectedItemIds.length < activeItems.length ? 'Cancel Selected' : 'Confirm Cancel'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function AppointmentsPage() {
   const { user, hydrated } = useAuth();
   const { openModal } = useAuthModal();
-  const { data, isLoading } = useMyBookings(!!user);
-  const cancel = useCancelBooking();
+  const { data, isLoading, error } = useMyBookings(!!user);
+  const [showQrId, setShowQrId] = useState<string | null>(null);
+  const [cancellingBooking, setCancellingBooking] = useState<MyBooking | null>(null);
+
   const bookings = data?.bookings ?? [];
 
   if (hydrated && !user) {
@@ -108,8 +235,13 @@ export default function AppointmentsPage() {
         <h1 className="font-display text-4xl">My visits</h1>
         <Link href="/book" className="btn-accent !py-2 text-sm">Book again</Link>
       </div>
-      {isLoading && <p>Loading visits…</p>}
-      {!isLoading && !bookings.length && (
+      {isLoading && <p className="opacity-60 text-sm">Loading visits…</p>}
+      {error && (
+        <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-600 text-xs">
+          Failed to load bookings: {(error as any)?.message ?? 'Server error'}
+        </div>
+      )}
+      {!isLoading && !error && !bookings.length && (
         <div className="card p-8 text-center">
           <p className="opacity-70">No visits yet.</p>
           <Link href="/book" className="btn-primary inline-block mt-4">Find a salon</Link>
@@ -117,6 +249,8 @@ export default function AppointmentsPage() {
       )}
       {bookings.map((b) => {
         const upcoming = ['REQUESTED', 'CONFIRMED'].includes(b.status);
+        const qrOpen = showQrId === b.id;
+
         return (
           <div key={b.id} className="card p-5">
             <div className="flex flex-wrap items-start gap-3">
@@ -129,15 +263,63 @@ export default function AppointmentsPage() {
               </div>
               <span className="chip !py-1 !px-3">{STATUS_LABEL[b.status] ?? b.status}</span>
             </div>
+
+            {/* Upcoming Booking: Check-in PIN and QR Card */}
+            {upcoming && (
+              <div className="mt-4 p-3.5 rounded-2xl bg-surface-raised border border-line flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] uppercase font-bold tracking-wider text-accent">Arrival Check-in PIN</span>
+                  <p className="font-mono text-xl font-bold tracking-widest mt-0.5">{b.checkin_pin ?? '—'}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowQrId(qrOpen ? null : b.id)}
+                  className="px-3.5 py-1.5 rounded-full border border-line text-xs font-medium hover:border-accent hover:text-accent transition"
+                >
+                  {qrOpen ? 'Hide QR' : 'Show Check-in QR'}
+                </button>
+              </div>
+            )}
+
+            {/* Scannable QR Code display */}
+            {upcoming && qrOpen && (
+              <div className="mt-3 p-5 bg-white text-black rounded-2xl border border-line flex flex-col items-center justify-center text-center">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(
+                    JSON.stringify({ code: b.booking_code, pin: b.checkin_pin, id: b.id })
+                  )}`}
+                  alt={`Check-in QR for ${b.booking_code}`}
+                  className="w-36 h-36 rounded-lg"
+                />
+                <p className="text-xs font-mono font-bold mt-2.5 tracking-widest">PIN: {b.checkin_pin}</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">Scan with partner scanner at reception for 1-tap arrival check-in</p>
+              </div>
+            )}
+
+            {/* Services breakdown if present */}
+            {b.items && b.items.length > 0 && (
+              <div className="mt-3.5 pt-3 border-t border-line space-y-1">
+                {b.items.map((item) => (
+                  <div key={item.id} className="flex items-center justify-between text-xs opacity-75">
+                    <span className={item.status === 'CANCELLED_BY_CUSTOMER' ? 'line-through opacity-50' : ''}>
+                      {item.service_name} {item.status === 'CANCELLED_BY_CUSTOMER' && '(Cancelled)'}
+                    </span>
+                    <span className="font-mono">{rupees(item.unit_price_paise)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center justify-between gap-3 mt-4 border-t border-line pt-3">
               <span className="font-display text-xl">{rupees(b.total_payable_paise)}</span>
               {upcoming && (
                 <button
-                  onClick={() => cancel.mutate({ id: b.id, reason: 'Changed plans' })}
-                  disabled={cancel.isPending}
-                  className="text-xs underline opacity-60 hover:opacity-100"
+                  type="button"
+                  onClick={() => setCancellingBooking(b)}
+                  className="text-xs underline opacity-60 hover:opacity-100 hover:text-red-500 transition"
                 >
-                  Cancel booking
+                  Cancel booking / services
                 </button>
               )}
               {b.status === 'COMPLETED' &&
@@ -150,6 +332,10 @@ export default function AppointmentsPage() {
           </div>
         );
       })}
+
+      {cancellingBooking && (
+        <CancelModal booking={cancellingBooking} onClose={() => setCancellingBooking(null)} />
+      )}
     </div>
   );
 }
