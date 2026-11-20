@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 import {
+  useAddonRecommendations,
   useAvailability,
   useCreateBooking,
   useCreatePaymentIntent,
@@ -57,6 +58,11 @@ export default function BookPage() {
   const activeSalonId = b.salonId ?? salons[0]?.id;
   const { data: profile, isLoading: loadingProfile } = useSalon(activeSalonId);
   const availability = useAvailability(activeSalonId, b.serviceIds, b.date, b.staffId);
+  const addons = useAddonRecommendations(activeSalonId, b.serviceIds, b.staffId);
+  const eligibleAddons = useMemo(
+    () => (addons.data?.addons ?? []).filter((a) => !b.serviceIds.includes(a.addon_service_id)),
+    [addons.data?.addons, b.serviceIds],
+  );
   const hold = useHold();
   const create = useCreateBooking();
   const capabilities = usePaymentCapabilities();
@@ -265,6 +271,42 @@ export default function BookPage() {
               </button>
             ))}
           </div>
+
+          {eligibleAddons.length > 0 && (
+            <div className="p-3.5 rounded-2xl bg-surface-raised border border-line space-y-2">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-accent flex items-center gap-1.5">
+                  <span>✨</span> Add a smart add-on?
+                </span>
+                <span className="text-[10px] opacity-60">Bundle discount applied</span>
+              </div>
+              <div className="flex gap-2 overflow-x-auto pb-1">
+                {eligibleAddons.slice(0, 3).map((addon) => (
+                  <div
+                    key={addon.addon_service_id}
+                    className="min-w-[210px] flex-1 p-2.5 rounded-xl border border-line/60 bg-background/60 flex flex-col justify-between text-xs"
+                  >
+                    <div>
+                      <p className="font-medium truncate">{addon.name}</p>
+                      <p className="text-[10px] opacity-60 mt-0.5">
+                        +{addon.duration_mins} min · save {rupees(addon.bundle_discount_paise)}
+                      </p>
+                    </div>
+                    <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-line/40">
+                      <span className="font-mono font-semibold">{rupees(addon.bundle_price_paise)}</span>
+                      <button
+                        type="button"
+                        onClick={() => b.toggleService(addon.addon_service_id)}
+                        className="text-[11px] font-semibold text-accent hover:underline px-2 py-0.5 rounded-md hover:bg-accent/10 transition"
+                      >
+                        + Add
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="flex items-center gap-3">
             <input

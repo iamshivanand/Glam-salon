@@ -107,6 +107,59 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
   app.get('/salons/:id', handleSalonProfile);
   app.get('/salons/:id/profile', handleSalonProfile); // API-12 blueprint route alias
 
+  const handleAddonRecommendations = async (req: any) => {
+    const { id } = req.params as { id: string };
+    const q = req.query as Record<string, string>;
+    const rawIds = q.service_ids ?? q.primary_service_ids ?? q.primary_service_id ?? q.service_id ?? '';
+    const selectedIds = rawIds
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => /^[0-9a-f-]{36}$/i.test(s));
+    const staffId = q.staff_id && /^[0-9a-f-]{36}$/i.test(q.staff_id) ? q.staff_id : null;
+
+    const rows = await query(
+      `SELECT DISTINCT ON (s.id)
+              a.id AS addon_mapping_id,
+              a.primary_service_id,
+              a.addon_service_id,
+              a.bundle_discount_paise,
+              a.priority_rank,
+              s.id AS service_id,
+              s.custom_name AS name,
+              s.description,
+              s.base_price_paise,
+              s.discounted_price_paise,
+              GREATEST(0, COALESCE(s.discounted_price_paise, s.base_price_paise) - a.bundle_discount_paise) AS bundle_price_paise,
+              s.duration_mins,
+              s.buffer_after_mins,
+              sc.name AS category_name,
+              (CASE WHEN $2::uuid[] IS NOT NULL AND a.primary_service_id = ANY($2::uuid[]) THEN 0 ELSE 1 END) AS match_rank
+         FROM salon_service_addons a
+         JOIN salon_services s ON s.id = a.addon_service_id
+         JOIN service_categories sc ON sc.id = s.category_id
+        WHERE a.salon_id = $1
+          AND a.is_active = TRUE
+          AND s.is_active = TRUE
+          AND ($2::uuid[] IS NULL OR NOT (s.id = ANY($2::uuid[])))
+          AND ($3::uuid IS NULL OR EXISTS (
+            SELECT 1 FROM staff_service_mapping ssm
+             WHERE ssm.staff_id = $3
+               AND ssm.salon_service_id = s.id
+          ) OR NOT EXISTS (
+            SELECT 1 FROM staff_service_mapping ssm WHERE ssm.staff_id = $3
+          ))
+        ORDER BY s.id, match_rank ASC, a.priority_rank ASC, bundle_price_paise ASC
+        LIMIT 6`,
+      [id, selectedIds.length ? selectedIds : null, staffId],
+    );
+
+    rows.sort((a, b) => (a.match_rank - b.match_rank) || (a.priority_rank - b.priority_rank));
+    return { addons: rows };
+  };
+
+  app.get('/salons/:id/addons/recommend', handleAddonRecommendations); // API-14
+  app.get('/salons/:id/addons', handleAddonRecommendations);
+
   app.get('/salons/:id/availability', async (req) => {
     const { id } = req.params as { id: string };
     const q = parse(AvailabilityQuery, req.query);

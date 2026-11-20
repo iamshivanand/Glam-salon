@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { one, query } from '../db.js';
 import { parse, badRequest, notFound } from '../http.js';
 import { authenticate, requireRole } from '../auth.js';
+import { queueTransactional } from '../services/transactional.js';
 
 export const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', authenticate);
@@ -45,16 +46,21 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     return { submissions: rows };
   });
 
-  app.post('/admin/kyc/:salonId/review', async (req) => {
-    const { salonId } = req.params as { salonId: string };
+  const handleKycReview = async (req: any) => {
+    const salonId = (req.params as any).salonId ?? (req.params as any).id;
     const body = parse(
       z.object({
-        decision: z.enum(['APPROVED', 'REJECTED', 'UNDER_REVIEW']),
+        decision: z.enum(['APPROVED', 'REJECTED', 'UNDER_REVIEW']).optional(),
+        status: z.enum(['APPROVED', 'REJECTED', 'UNDER_REVIEW']).optional(),
         rejection_reason: z.string().max(500).optional(),
       }),
       req.body,
     );
-    if (body.decision === 'REJECTED' && !body.rejection_reason) {
+    const decision = body.decision ?? body.status;
+    if (!decision) {
+      throw badRequest('VALIDATION_ERROR', 'decision or status is required');
+    }
+    if (decision === 'REJECTED' && !body.rejection_reason) {
       throw badRequest('VALIDATION_ERROR', 'rejection_reason is required when rejecting');
     }
 
@@ -62,13 +68,35 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
       `UPDATE salon_kyc_verifications
           SET status = $2, rejection_reason = $3, reviewed_by_admin_id = $4, reviewed_at = NOW()
         WHERE salon_id = $1 RETURNING *`,
-      [salonId, body.decision, body.rejection_reason ?? null, req.auth!.id],
+      [salonId, decision, body.rejection_reason ?? null, req.auth!.id],
     );
     if (!kyc) throw notFound('KYC submission not found');
 
-    await query(`UPDATE salons SET verification_status = $2 WHERE id = $1`, [salonId, body.decision]);
-    return { salon_id: salonId, verification_status: body.decision };
-  });
+    await query(`UPDATE salons SET verification_status = $2 WHERE id = $1`, [salonId, decision]);
+
+    const salon = await one<{ id: string; name: string; owner_id: string }>(
+      `SELECT id, name, owner_id FROM salons WHERE id = $1`,
+      [salonId],
+    );
+    if (salon && (decision === 'APPROVED' || decision === 'REJECTED')) {
+      const template = decision === 'APPROVED' ? 'KYC_APPROVED' : 'KYC_REJECTED';
+      queueTransactional({
+        template,
+        userId: salon.owner_id,
+        salonId: salon.id,
+        context: {
+          customerName: 'Partner',
+          salonName: salon.name,
+          reason: body.rejection_reason,
+        },
+      });
+    }
+
+    return { salon_id: salonId, verification_status: decision };
+  };
+
+  app.post('/admin/kyc/:salonId/review', handleKycReview);
+  app.post('/admin/salons/:id/verify', handleKycReview);
 
   app.patch('/admin/salons/:id/commission', async (req) => {
     const { id } = req.params as { id: string };

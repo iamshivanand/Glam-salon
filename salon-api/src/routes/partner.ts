@@ -282,8 +282,8 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return row;
   });
 
-  app.patch('/partner/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const handleUpdateHygiene = async (req: any) => {
+    const salonId = (req.params as any)?.id ?? (await resolveSalonId(req));
     const body = parse(
       z.object({
         has_private_room: z.boolean().optional(),
@@ -324,7 +324,11 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         body.hygiene_checklist ? JSON.stringify(body.hygiene_checklist) : null,
       ],
     );
-  });
+  };
+
+  app.patch('/partner/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleUpdateHygiene);
+  app.put('/partner/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleUpdateHygiene);
+  app.patch('/partner/salons/:id/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleUpdateHygiene);
 
   // ---------- Catalog ----------
   app.get('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
@@ -338,8 +342,8 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { services };
   });
 
-  app.post('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const handleCreateService = async (req: any) => {
+    const salonId = (req.params as any)?.id ?? (await resolveSalonId(req));
     const body = parse(ServiceInput, req.body);
     const created = await one(
       `INSERT INTO salon_services
@@ -366,7 +370,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     );
     await invalidateSalonProfileCache(salonId);
     return created;
-  });
+  };
+
+  app.post('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleCreateService);
+  app.post('/partner/salons/:id/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleCreateService); // API-25 contract alias
 
   app.patch('/partner/services/:id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);

@@ -168,6 +168,7 @@ export const qk = {
   categories: ['categories'] as const,
   availability: (salonId?: string, services?: string[], date?: string, staff?: string) =>
     ['availability', salonId, services?.join(','), date, staff] as const,
+  addons: (salonId?: string, primary?: string, staff?: string) => ['addons', salonId, primary, staff] as const,
   myBookings: ['my-bookings'] as const,
   dashboard: (period: string) => ['partner', 'dashboard', period] as const,
   partnerBookings: (date: string) => ['partner', 'bookings', date] as const,
@@ -409,6 +410,35 @@ export function useAvailability(salonId?: string, serviceIds: string[] = [], dat
         `/salons/${salonId}/availability${qs({ service_ids: serviceIds.join(','), date, staff_id: staffId })}`,
       ),
     enabled: !!salonId && serviceIds.length > 0 && !!date,
+  });
+}
+
+export interface AddonRecommendation {
+  addon_mapping_id: string;
+  primary_service_id: string;
+  addon_service_id: string;
+  bundle_discount_paise: number;
+  priority_rank: number;
+  service_id: string;
+  name: string;
+  description: string | null;
+  base_price_paise: number;
+  discounted_price_paise: number | null;
+  bundle_price_paise: number;
+  duration_mins: number;
+  buffer_after_mins: number;
+  category_name: string;
+}
+
+export function useAddonRecommendations(salonId?: string, serviceIds?: string | string[], staffId?: string) {
+  const serviceIdsStr = Array.isArray(serviceIds) ? serviceIds.filter(Boolean).join(',') : (serviceIds ?? '');
+  return useQuery({
+    queryKey: qk.addons(salonId, serviceIdsStr, staffId),
+    queryFn: () =>
+      api<{ addons: AddonRecommendation[] }>(
+        `/salons/${salonId}/addons/recommend${qs({ service_ids: serviceIdsStr, staff_id: staffId })}`,
+      ),
+    enabled: !!salonId,
   });
 }
 
