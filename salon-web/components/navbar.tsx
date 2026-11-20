@@ -52,6 +52,7 @@ export function Navbar() {
         </Link>
         <nav className="hidden md:flex gap-5 text-sm">
           <Link href="/services">Services</Link>
+          <Link href="/compare">Compare</Link>
           <Link href="/book">Book</Link>
           <Link href="/appointments">My visits</Link>
           <Link href="/account">Account</Link>

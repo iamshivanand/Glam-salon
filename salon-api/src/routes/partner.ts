@@ -12,6 +12,7 @@ import { liveQueue, updateQueueStatus } from '../services/queue.js';
 import { reminderFunnel } from '../services/engagement.js';
 import { listPaymentsForSalon, refundPayment, settlementsForSalon } from '../services/payments.js';
 import { fmtLocalDate } from '../services/availability.js';
+import { invalidateSalonProfileCache } from '../services/discovery.js';
 
 const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
@@ -233,7 +234,9 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     if (!sets.length) throw badRequest('VALIDATION_ERROR', 'No fields to update');
 
     params.push(salonId);
-    return one(`UPDATE salons SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`, params);
+    const updated = await one(`UPDATE salons SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`, params);
+    await invalidateSalonProfileCache(salonId);
+    return updated;
   });
 
   app.post('/partner/salon/submit', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
@@ -337,7 +340,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   app.post('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
     const body = parse(ServiceInput, req.body);
-    return one(
+    const created = await one(
       `INSERT INTO salon_services
          (salon_id, category_id, custom_name, description, pricing_model, base_price_paise,
           discounted_price_paise, duration_mins, buffer_after_mins, reminder_interval_days,
@@ -360,6 +363,8 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         JSON.stringify(body.quote_questions_schema ?? []),
       ],
     );
+    await invalidateSalonProfileCache(salonId);
+    return created;
   });
 
   app.patch('/partner/services/:id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
@@ -397,6 +402,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       params,
     );
     if (!row) throw notFound('Service not found');
+    await invalidateSalonProfileCache(salonId);
     return row;
   });
 
@@ -408,6 +414,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       [id, salonId],
     );
     if (!row) throw notFound('Service not found');
+    await invalidateSalonProfileCache(salonId);
     return { ok: true };
   });
 

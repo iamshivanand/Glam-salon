@@ -92,14 +92,17 @@ export const discoveryRoutes: FastifyPluginAsync = async (app) => {
     return compareSalons(ids, q.category_id);
   });
 
-  app.get('/salons/:id', async (req) => {
+  const handleSalonProfile = async (req: any) => {
     const { id } = req.params as { id: string };
     const profile = await salonProfile(id);
     if (!profile.is_active || profile.verification_status !== 'APPROVED') {
       throw notFound('Salon not found');
     }
     return profile;
-  });
+  };
+
+  app.get('/salons/:id', handleSalonProfile);
+  app.get('/salons/:id/profile', handleSalonProfile); // API-12 blueprint route alias
 
   app.get('/salons/:id/availability', async (req) => {
     const { id } = req.params as { id: string };

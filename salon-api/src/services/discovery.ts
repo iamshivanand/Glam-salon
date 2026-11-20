@@ -1,4 +1,5 @@
 import { one, query } from '../db.js';
+import { redis } from '../redis.js';
 import { badRequest, notFound } from '../http.js';
 import { computeAvailability, nextAvailableSlot, fmtLocalDate } from './availability.js';
 
@@ -165,7 +166,20 @@ export async function compareSalons(salonIds: string[], categoryId: string) {
         ORDER BY COALESCE(discounted_price_paise, base_price_paise) ASC LIMIT 1`,
       [salonId, categoryId],
     );
-    const facilities = await one(`SELECT * FROM salon_hygiene_facilities WHERE salon_id = $1`, [salonId]);
+    const facilities = await one(
+      `SELECT h.*, u.full_name AS verified_by_admin_name
+         FROM salon_hygiene_facilities h
+         LEFT JOIN users u ON u.id = h.verified_by_admin_id
+        WHERE h.salon_id = $1`,
+      [salonId],
+    );
+    const queue = await one<{ waiting_count: number; estimated_wait_mins: number }>(
+      `SELECT COUNT(*)::int AS waiting_count,
+              COALESCE(MIN(estimated_wait_mins), 0)::int AS estimated_wait_mins
+         FROM walkin_queue_tokens
+        WHERE salon_id = $1 AND queue_date = CURRENT_DATE AND status = 'WAITING'`,
+      [salonId],
+    );
     const slot = await nextAvailableSlot(salonId);
     comparison.push({
       salon_id: salon.id,
@@ -181,10 +195,13 @@ export async function compareSalons(salonIds: string[], categoryId: string) {
             autoclave_sterilization: facilities.autoclave_sterilization,
             wheelchair_accessible: facilities.wheelchair_accessible,
             has_women_only_zone: facilities.has_women_only_zone,
+            verified_by_admin_name: facilities.verified_by_admin_name ?? null,
+            verified_at: facilities.verified_at ?? null,
           }
         : null,
       next_slot: slot ? slot.slice(11, 16) : null,
-      queue_wait_mins: 0,
+      queue_wait_mins: queue?.estimated_wait_mins ?? 0,
+      queue_waiting_count: queue?.waiting_count ?? 0,
     });
   }
   return { category: category.name, comparison };
@@ -264,9 +281,23 @@ export async function urgentSlots(input: {
 }
 
 export async function salonProfile(salonId: string): Promise<Record<string, any>> {
+  const cacheKey = `salon:profile:${salonId}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch {}
+  }
+
   const salon = await one(`SELECT * FROM salons WHERE id = $1`, [salonId]);
   if (!salon) throw notFound('Salon not found');
-  const facilities = await one(`SELECT * FROM salon_hygiene_facilities WHERE salon_id = $1`, [salonId]);
+  const facilities = await one(
+    `SELECT h.*, u.full_name AS verified_by_admin_name
+       FROM salon_hygiene_facilities h
+       LEFT JOIN users u ON u.id = h.verified_by_admin_id
+      WHERE h.salon_id = $1`,
+    [salonId],
+  );
   const services = await query(
     `SELECT ss.*, sc.name AS category_name, sc.slug AS category_slug
        FROM salon_services ss
@@ -292,11 +323,19 @@ export async function salonProfile(salonId: string): Promise<Record<string, any>
     [salonId],
   );
 
-  return {
+  const profile = {
     ...salon,
     hygiene_facilities: facilities ?? null,
     services,
     staff,
     reviews,
   };
+
+  // Cache in Redis for 10 minutes
+  await redis.set(cacheKey, JSON.stringify(profile), 'EX', 600);
+  return profile;
+}
+
+export async function invalidateSalonProfileCache(salonId: string): Promise<void> {
+  await redis.del(`salon:profile:${salonId}`);
 }

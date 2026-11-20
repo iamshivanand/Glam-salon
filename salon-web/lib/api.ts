@@ -330,6 +330,38 @@ export function useCategories() {
   });
 }
 
+export interface SalonComparisonItem {
+  salon_id: string;
+  salon_name: string;
+  service_name: string | null;
+  price_paise: number | null;
+  pricing_model: 'FIXED' | 'STARTING_FROM_QUOTE' | null;
+  duration_mins: number | null;
+  facilities: {
+    has_private_room: boolean;
+    uses_disposable_kits: boolean;
+    autoclave_sterilization: boolean;
+    wheelchair_accessible: boolean;
+    has_women_only_zone: boolean;
+    verified_by_admin_name?: string | null;
+    verified_at?: string | null;
+  } | null;
+  next_slot: string | null;
+  queue_wait_mins: number;
+  queue_waiting_count?: number;
+}
+
+export function useCompareSalons(salonIds: string[], categoryId?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['compare', salonIds.join(','), categoryId],
+    queryFn: () =>
+      api<{ category: string; comparison: SalonComparisonItem[] }>(
+        `/discovery/compare${qs({ salon_ids: salonIds.join(','), category_id: categoryId })}`,
+      ),
+    enabled: enabled && salonIds.length >= 2 && !!categoryId,
+  });
+}
+
 export function useAvailability(salonId?: string, serviceIds: string[] = [], date?: string, staffId?: string) {
   return useQuery({
     queryKey: qk.availability(salonId, serviceIds, date, staffId),
