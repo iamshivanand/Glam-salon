@@ -272,7 +272,7 @@ export async function createBooking(opts: {
         });
       }
 
-      await suppressReminders(client, opts.customerId, hold.salon_id);
+      await suppressReminders(client, opts.customerId, hold.salon_id, row.id);
       return row;
     });
 

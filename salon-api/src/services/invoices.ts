@@ -1,7 +1,7 @@
 import { one, tx } from '../db.js';
 import { badRequest, conflict, notFound } from '../http.js';
 import { randomToken } from '../crypto.js';
-import { scheduleReminders } from './reminders.js';
+import { scheduleReminders, calculateAdaptiveInterval } from './reminders.js';
 import { queueTransactional } from './transactional.js';
 
 const GST_RATE = 0.18;
@@ -135,7 +135,7 @@ export async function createInvoice(input: InvoiceInput) {
         )
       ).rows[0];
 
-      const intervalDays =
+      const baseServiceInterval =
         (
           await client.query(
             `SELECT COALESCE(s.reminder_interval_days, c.default_reminder_interval_days, 25)::int AS days
@@ -149,8 +149,37 @@ export async function createInvoice(input: InvoiceInput) {
           )
         ).rows[0]?.days ?? 25;
 
+      const existingCrm = (
+        await client.query<{
+          last_visit_at: Date | null;
+          computed_visit_interval_days: number | null;
+          total_visits: number;
+        }>(
+          `SELECT last_visit_at, computed_visit_interval_days, total_visits
+             FROM salon_customer_crm
+            WHERE salon_id = $1 AND customer_id = $2`,
+          [input.salonId, customerId],
+        )
+      ).rows[0];
+
+      // F1.12 Adaptive Next-Visit Interval Formula (EWMA):
+      // On visit N = 1, uses service reminder_interval_days clamped to [7, 90].
+      // For N >= 2, computes Interval_new = round(0.7 * ActualDaysSinceLastVisit + 0.3 * Interval_old) clamped to [7, 90].
+      let actualDaysSinceLastVisit: number | null = null;
+      if (existingCrm?.last_visit_at) {
+        const ms = Date.now() - new Date(existingCrm.last_visit_at).getTime();
+        actualDaysSinceLastVisit = Math.max(1, Math.round(ms / 86_400_000));
+      }
+      const isRepeatVisit = Boolean(existingCrm && (existingCrm.total_visits >= 1 || existingCrm.last_visit_at));
+      const effectiveIntervalDays = calculateAdaptiveInterval({
+        actualDaysSinceLastVisit,
+        previousIntervalDays: existingCrm?.computed_visit_interval_days,
+        baseServiceIntervalDays: baseServiceInterval,
+        isRepeatVisit,
+      });
+
       const earnedPoints = Math.floor(net * POINTS_PER_RUPEE / 100) || Math.floor(net / 10000);
-      const nextExpected = new Date(Date.now() + intervalDays * 86_400_000).toISOString().slice(0, 10);
+      const nextExpected = new Date(Date.now() + effectiveIntervalDays * 86_400_000).toISOString().slice(0, 10);
 
       await client.query(
         `INSERT INTO salon_customer_crm
@@ -175,7 +204,7 @@ export async function createInvoice(input: InvoiceInput) {
           `CUST-${customerId.slice(0, 6).toUpperCase()}`,
           nextExpected,
           net,
-          intervalDays,
+          effectiveIntervalDays,
           earnedPoints,
           redeemPoints,
         ],
@@ -221,7 +250,7 @@ export async function createInvoice(input: InvoiceInput) {
           bookingId,
           serviceCategoryId,
           completedAt: new Date(),
-          intervalDays,
+          intervalDays: effectiveIntervalDays,
         });
       }
 

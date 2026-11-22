@@ -21,8 +21,8 @@ const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
 
 async function resolveSalonId(req: any): Promise<string> {
-  const header = req.headers['x-salon-id'];
-  const requested = typeof header === 'string' ? header : undefined;
+  const paramOrHeader = req.params?.id ?? req.headers['x-salon-id'];
+  const requested = typeof paramOrHeader === 'string' && /^[0-9a-f-]{36}$/i.test(paramOrHeader) ? paramOrHeader : undefined;
   if (requested) {
     const owned = await one(
       `SELECT id FROM salons WHERE id = $1 AND (owner_id = $2 OR $3 = 'PLATFORM_ADMIN')`,
@@ -1203,21 +1203,24 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- Retention reminders ----------
-  app.get('/partner/reminders', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  const getRemindersHandler = async (req: any) => {
     const salonId = await resolveSalonId(req);
     const q = parse(z.object({ status: z.string().optional(), from: z.string().optional() }), req.query);
     return listReminders(salonId, {
       status: q.status ? q.status.split(',') : undefined,
       from: q.from,
     });
-  });
+  };
+
+  app.get('/partner/reminders', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getRemindersHandler);
+  app.get('/partner/salons/:id/reminders', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getRemindersHandler); // API-32
 
   app.get('/partner/reminders/analytics', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
     return { funnel: await reminderFunnel(salonId) };
   });
 
-  app.post('/partner/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  const triggerRemindersHandler = async (req: any) => {
     const salonId = await resolveSalonId(req);
     const body = parse(
       z.object({
@@ -1235,7 +1238,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       templateCode: body.template_code,
       serviceCategoryId: body.service_category_id,
     });
-  });
+  };
+
+  app.post('/partner/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, triggerRemindersHandler);
+  app.post('/partner/salons/:id/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, triggerRemindersHandler); // API-33
 
   app.post('/partner/reminders/dispatch', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
