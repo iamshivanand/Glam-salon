@@ -304,6 +304,8 @@ export interface PartnerBooking {
   checkin_pin: string;
   customer_name: string;
   customer_notes: string | null;
+  is_prepaid?: boolean;
+  prepaid_payment_id?: string | null;
   items: {
     id: string;
     service_name: string;
@@ -863,11 +865,25 @@ export function useUpdateBookingStatus() {
 export function useCreateInvoice() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ bookingId, method }: { bookingId: string; method: string }) =>
-      api<{ invoice_number: string; net_collected_paise: number }>('/partner/invoices', {
+    mutationFn: (body: {
+      bookingId?: string;
+      walkinTokenId?: string;
+      method?: string;
+      discount_paise?: number;
+      redeem_loyalty_points?: number;
+      split_payments?: { method: string; amount_paise: number }[];
+    }) =>
+      api<{ invoice_number: string; net_collected_paise: number; method: string }>('/partner/invoices', {
         method: 'POST',
         key: crypto.randomUUID(),
-        body: { booking_id: bookingId, method },
+        body: {
+          booking_id: body.bookingId,
+          walkin_token_id: body.walkinTokenId,
+          method: body.method ?? (body.split_payments?.length ? 'SPLIT' : 'CASH'),
+          discount_paise: body.discount_paise,
+          redeem_loyalty_points: body.redeem_loyalty_points,
+          split_payments: body.split_payments,
+        },
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['partner'] }),
   });

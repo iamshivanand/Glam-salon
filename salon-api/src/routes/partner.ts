@@ -772,6 +772,15 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     const date = q.date ?? fmtLocalDate(new Date());
     const bookings = await query(
       `SELECT b.*, u.full_name AS customer_name, u.phone_blind_index,
+              EXISTS (
+                SELECT 1 FROM payment_orders po
+                 WHERE po.booking_id = b.id AND po.status = 'PAID'
+              ) AS is_prepaid,
+              (
+                SELECT po.provider_payment_id FROM payment_orders po
+                 WHERE po.booking_id = b.id AND po.status = 'PAID'
+                 ORDER BY po.created_at DESC LIMIT 1
+              ) AS prepaid_payment_id,
               COALESCE(json_agg(json_build_object(
                 'id', bi.id, 'service_name', bi.service_name_snapshot, 'staff_id', bi.staff_id,
                 'staff_name', sm.display_name, 'start_at', lower(bi.time_range), 'end_at', upper(bi.time_range),
@@ -845,7 +854,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- Billing ----------
-  app.post('/partner/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  const createInvoiceHandler = async (req: any, reply: any) => {
     const salonId = await resolveSalonId(req);
     const key = req.headers['idempotency-key'];
     if (typeof key !== 'string' || key.length < 8) {
@@ -857,21 +866,37 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         walkin_token_id: z.string().uuid().optional(),
         discount_paise: z.number().int().min(0).optional(),
         redeem_loyalty_points: z.number().int().min(0).optional(),
-        method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM', 'PREPAID_WALLET', 'SPLIT']),
+        method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM', 'PREPAID_WALLET', 'SPLIT']).optional(),
+        payment_method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM', 'PREPAID_WALLET', 'SPLIT']).optional(),
+        split_payments: z
+          .array(
+            z.object({
+              method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM']),
+              amount_paise: z.number().int().positive(),
+            }),
+          )
+          .optional(),
       }),
       req.body,
     );
-    return createInvoice({
+    const chosenMethod = body.payment_method ?? body.method ?? (body.split_payments?.length ? 'SPLIT' : 'CASH');
+    const invoice = await createInvoice({
       salonId,
       actor: req.auth!,
       bookingId: body.booking_id,
       walkinTokenId: body.walkin_token_id,
       discountPaise: body.discount_paise,
       redeemLoyaltyPoints: body.redeem_loyalty_points,
-      method: body.method,
+      method: chosenMethod,
+      splitPayments: body.split_payments,
       idempotencyKey: key,
     });
-  });
+    reply.status(201);
+    return invoice;
+  };
+
+  app.post('/partner/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createInvoiceHandler);
+  app.post('/partner/salons/:id/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createInvoiceHandler); // API-34
 
   app.get('/partner/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);

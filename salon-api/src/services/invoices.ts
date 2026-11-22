@@ -8,6 +8,12 @@ const GST_RATE = 0.18;
 const POINT_VALUE_PAISE = 100; // 1 loyalty point = ₹1
 const POINTS_PER_RUPEE = 1 / 100; // earn 1 point per ₹100
 
+export interface SplitPaymentDetail {
+  method: 'CASH' | 'UPI_QR' | 'CARD' | 'ONLINE_UPI' | 'LOYALTY_REDEEM';
+  amount_paise?: number;
+  amountPaise?: number;
+}
+
 export interface InvoiceInput {
   salonId: string;
   actor: { id: string; role: string };
@@ -16,7 +22,49 @@ export interface InvoiceInput {
   discountPaise?: number;
   redeemLoyaltyPoints?: number;
   method: string;
+  splitPayments?: SplitPaymentDetail[];
   idempotencyKey: string;
+}
+
+export function calculateInvoiceTotals(opts: {
+  grossPaise: number;
+  discountPaise?: number;
+  loyaltyRedeemedPaise?: number;
+  gstRate?: number;
+  commissionBps: number;
+}) {
+  const gross = Math.max(0, opts.grossPaise);
+  const discount = Math.min(gross, Math.max(0, opts.discountPaise ?? 0));
+  const loyalty = Math.min(gross - discount, Math.max(0, opts.loyaltyRedeemedPaise ?? 0));
+  const taxable = Math.max(0, gross - discount - loyalty);
+  const tax = Math.round(taxable * (opts.gstRate ?? GST_RATE));
+  const net = taxable + tax;
+  const commission = Math.round((net * opts.commissionBps) / 10000);
+  const partnerSettlement = net - commission;
+  return { gross, discount, loyalty, taxable, tax, net, commission, partnerSettlement };
+}
+
+export function validateSplitPayments(
+  splitPayments: SplitPaymentDetail[] | undefined,
+  expectedNetPaise: number,
+): { method: string; amount_paise: number }[] {
+  if (!Array.isArray(splitPayments) || splitPayments.length < 2) {
+    throw badRequest('INVALID_SPLIT_PAYMENT', 'Split payment requires at least two payment components');
+  }
+  const splitSum = splitPayments.reduce(
+    (sum: number, p) => sum + Number(p.amount_paise ?? p.amountPaise ?? 0),
+    0,
+  );
+  if (splitSum !== expectedNetPaise) {
+    throw badRequest(
+      'SPLIT_AMOUNT_MISMATCH',
+      `Sum of split payments (₹${(splitSum / 100).toFixed(2)}) must exactly equal net payable amount (₹${(expectedNetPaise / 100).toFixed(2)})`,
+    );
+  }
+  return splitPayments.map((p) => ({
+    method: p.method,
+    amount_paise: Number(p.amount_paise ?? p.amountPaise),
+  }));
 }
 
 export async function createInvoice(input: InvoiceInput) {
@@ -106,34 +154,118 @@ export async function createInvoice(input: InvoiceInput) {
       const commission = Math.round((net * bps) / 10000);
       const partnerSettlement = net - commission;
 
+      let gatewayOrderId: string | null = null;
+      let gatewayPaymentId: string | null = null;
+      let finalMethod = input.method;
+
+      // 1. Detect if customer pre-paid online at booking time via payment_orders
+      if (bookingId) {
+        const prepaidOrder = (
+          await client.query<{
+            id: string;
+            provider_order_id: string | null;
+            provider_payment_id: string | null;
+            amount_paise: number;
+          }>(
+            `SELECT id, provider_order_id, provider_payment_id, amount_paise
+               FROM payment_orders
+              WHERE booking_id = $1 AND salon_id = $2 AND status = 'PAID'
+              ORDER BY created_at DESC LIMIT 1`,
+            [bookingId, input.salonId],
+          )
+        ).rows[0];
+
+        if (prepaidOrder) {
+          finalMethod = 'ONLINE_UPI';
+          gatewayOrderId = prepaidOrder.provider_order_id ?? null;
+          gatewayPaymentId = prepaidOrder.provider_payment_id ?? null;
+        }
+      }
+
+      // 2. Handle split payment flow if method is SPLIT or splitPayments provided
+      const rawSplit = input.splitPayments ?? (input as any).split_payments;
+      let splitPaymentsJson: { method: string; amount_paise: number }[] = [];
+      if (!gatewayPaymentId && (finalMethod === 'SPLIT' || (Array.isArray(rawSplit) && rawSplit.length > 0))) {
+        finalMethod = 'SPLIT';
+        splitPaymentsJson = validateSplitPayments(rawSplit, net);
+      }
+
       const invoiceNumber = `INV-${input.salonId.slice(0, 4).toUpperCase()}-${new Date().getUTCFullYear()}-${randomToken(3).toUpperCase()}`;
-      const invoice = (
+      let invoice: any;
+      try {
+        invoice = (
+          await client.query(
+            `INSERT INTO invoices_and_payments
+               (invoice_number, idempotency_key, salon_id, customer_id, booking_id, walkin_token_id,
+                gross_amount_paise, discount_paise, loyalty_redeemed_paise, wallet_redeemed_paise,
+                tax_paise, net_collected_paise, platform_commission_paise, partner_net_settlement_paise,
+                method, status, gateway_order_id, gateway_payment_id, split_details_json)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,'CAPTURED',$15,$16,$17::jsonb)
+             RETURNING *`,
+            [
+              invoiceNumber,
+              input.idempotencyKey,
+              input.salonId,
+              customerId,
+              bookingId,
+              walkinTokenId,
+              gross,
+              discount,
+              loyaltyRedeemed,
+              tax,
+              net,
+              commission,
+              partnerSettlement,
+              finalMethod,
+              gatewayOrderId,
+              gatewayPaymentId,
+              JSON.stringify(splitPaymentsJson),
+            ],
+          )
+        ).rows[0];
+      } catch (err: any) {
+        if (err.code === '42703') {
+          // split_details_json column fallback for unmigrated environments
+          invoice = (
+            await client.query(
+              `INSERT INTO invoices_and_payments
+                 (invoice_number, idempotency_key, salon_id, customer_id, booking_id, walkin_token_id,
+                  gross_amount_paise, discount_paise, loyalty_redeemed_paise, wallet_redeemed_paise,
+                  tax_paise, net_collected_paise, platform_commission_paise, partner_net_settlement_paise,
+                  method, status, gateway_order_id, gateway_payment_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,'CAPTURED',$15,$16)
+               RETURNING *`,
+              [
+                invoiceNumber,
+                input.idempotencyKey,
+                input.salonId,
+                customerId,
+                bookingId,
+                walkinTokenId,
+                gross,
+                discount,
+                loyaltyRedeemed,
+                tax,
+                net,
+                commission,
+                partnerSettlement,
+                finalMethod,
+                gatewayOrderId,
+                gatewayPaymentId,
+              ],
+            )
+          ).rows[0];
+        } else {
+          throw err;
+        }
+      }
+
+      if (bookingId && gatewayPaymentId) {
         await client.query(
-          `INSERT INTO invoices_and_payments
-             (invoice_number, idempotency_key, salon_id, customer_id, booking_id, walkin_token_id,
-              gross_amount_paise, discount_paise, loyalty_redeemed_paise, wallet_redeemed_paise,
-              tax_paise, net_collected_paise, platform_commission_paise, partner_net_settlement_paise,
-              method, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,'CAPTURED')
-           RETURNING *`,
-          [
-            invoiceNumber,
-            input.idempotencyKey,
-            input.salonId,
-            customerId,
-            bookingId,
-            walkinTokenId,
-            gross,
-            discount,
-            loyaltyRedeemed,
-            tax,
-            net,
-            commission,
-            partnerSettlement,
-            input.method,
-          ],
-        )
-      ).rows[0];
+          `UPDATE payment_orders SET invoice_id = $1 WHERE booking_id = $2 AND status = 'PAID'`,
+          [invoice.id, bookingId],
+        );
+      }
 
       const baseServiceInterval =
         (
@@ -269,7 +401,13 @@ export async function createInvoice(input: InvoiceInput) {
         );
       }
 
-      return { ...invoice, earned_points: earnedPoints, redeemed_points: redeemPoints };
+      return {
+        ...invoice,
+        earned_points: earnedPoints,
+        redeemed_points: redeemPoints,
+        split_details: splitPaymentsJson,
+        is_prepaid: Boolean(gatewayPaymentId),
+      };
     });
 
     const customer = await one<{ full_name: string }>(`SELECT full_name FROM users WHERE id = $1`, [result.customer_id]);
