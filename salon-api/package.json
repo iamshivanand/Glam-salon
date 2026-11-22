@@ -16,7 +16,7 @@
     "db:reset": "tsx scripts/reset.ts",
     "dispatch": "tsx scripts/dispatch.ts",
     "smoke": "tsx scripts/smoke.ts",
-    "test": "tsx --test test/signatures.test.ts test/storage.test.ts test/rendering.test.ts test/reminders.test.ts test/invoices.test.ts"
+    "test": "tsx --test test/signatures.test.ts test/storage.test.ts test/rendering.test.ts test/reminders.test.ts test/invoices.test.ts test/ledger.test.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

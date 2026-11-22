@@ -8,6 +8,14 @@ const GST_RATE = 0.18;
 const POINT_VALUE_PAISE = 100; // 1 loyalty point = ₹1
 const POINTS_PER_RUPEE = 1 / 100; // earn 1 point per ₹100
 
+export function calculateLoyaltyEarned(netPaise: number): number {
+  return Math.floor(Math.max(0, netPaise) / 10000);
+}
+
+export function calculateLoyaltyRedemptionValue(points: number): number {
+  return Math.max(0, points) * POINT_VALUE_PAISE;
+}
+
 export interface SplitPaymentDetail {
   method: 'CASH' | 'UPI_QR' | 'CARD' | 'ONLINE_UPI' | 'LOYALTY_REDEEM';
   amount_paise?: number;
@@ -140,7 +148,7 @@ export async function createInvoice(input: InvoiceInput) {
       const requestedPoints = Math.max(0, input.redeemLoyaltyPoints ?? 0);
       const maxRedeemable = Math.floor((gross - discount) / POINT_VALUE_PAISE);
       const redeemPoints = Math.min(requestedPoints, availablePoints, maxRedeemable);
-      const loyaltyRedeemed = redeemPoints * POINT_VALUE_PAISE;
+      const loyaltyRedeemed = calculateLoyaltyRedemptionValue(redeemPoints);
 
       const taxable = Math.max(0, gross - discount - loyaltyRedeemed);
       const tax = Math.round(taxable * GST_RATE);
@@ -310,7 +318,7 @@ export async function createInvoice(input: InvoiceInput) {
         isRepeatVisit,
       });
 
-      const earnedPoints = Math.floor(net * POINTS_PER_RUPEE / 100) || Math.floor(net / 10000);
+      const earnedPoints = calculateLoyaltyEarned(net);
       const nextExpected = new Date(Date.now() + effectiveIntervalDays * 86_400_000).toISOString().slice(0, 10);
 
       await client.query(

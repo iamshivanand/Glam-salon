@@ -351,6 +351,81 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     return { vaults, photo_consent_granted: photoConsentGranted };
   });
 
+  // Ticket 14 (F1.14): Customer loyalty points passbook & ledger history
+  app.get('/users/me/loyalty-ledger', { preHandler: [authenticate] }, async (req) => {
+    const customerId = req.auth!.id;
+    const q = req.query as { bucket?: string };
+    const bucket = q.bucket ?? 'ALL';
+
+    return withUser(customerId, async (client) => {
+      // 1. Get total points and per-salon balances from CRM
+      const balancesRes = await client.query<{
+        salon_id: string;
+        salon_name: string;
+        locality: string;
+        loyalty_points_balance: number;
+        prepaid_purchased_balance_paise: number;
+        prepaid_promo_balance_paise: number;
+        total_visits: number;
+        last_visit_at: string;
+      }>(
+        `SELECT c.salon_id, s.name AS salon_name, s.locality,
+                c.loyalty_points_balance,
+                c.prepaid_purchased_balance_paise,
+                c.prepaid_promo_balance_paise,
+                c.total_visits,
+                c.last_visit_at
+           FROM salon_customer_crm c
+           JOIN salons s ON s.id = c.salon_id
+          WHERE c.customer_id = $1
+          ORDER BY c.last_visit_at DESC`,
+        [customerId],
+      );
+
+      const balances = balancesRes.rows;
+      const totalPoints = balances.reduce((sum, b) => sum + Number(b.loyalty_points_balance || 0), 0);
+      const totalWalletPaise = balances.reduce((sum, b) => sum + Number(b.prepaid_purchased_balance_paise || 0), 0);
+      const totalPromoPaise = balances.reduce((sum, b) => sum + Number(b.prepaid_promo_balance_paise || 0), 0);
+
+      // 2. Query itemized transactions from immutable customer_value_ledger
+      const entriesRes = await client.query<{
+        id: string;
+        salon_id: string;
+        salon_name: string;
+        locality: string;
+        invoice_id: string | null;
+        invoice_number: string | null;
+        bucket: string;
+        entry_type: string;
+        amount_delta: number;
+        balance_after: number;
+        notes: string | null;
+        created_at: string;
+      }>(
+        `SELECT cvl.id, cvl.salon_id, s.name AS salon_name, s.locality,
+                cvl.invoice_id, inv.invoice_number,
+                cvl.bucket, cvl.entry_type, cvl.amount_delta, cvl.balance_after,
+                cvl.notes, cvl.created_at
+           FROM customer_value_ledger cvl
+           JOIN salons s ON s.id = cvl.salon_id
+           LEFT JOIN invoices_and_payments inv ON inv.id = cvl.invoice_id
+          WHERE cvl.customer_id = $1
+            AND ($2::text IS NULL OR cvl.bucket::text = $2)
+          ORDER BY cvl.created_at DESC
+          LIMIT 100`,
+        [customerId, bucket === 'ALL' ? null : bucket],
+      );
+
+      return {
+        total_points: totalPoints,
+        total_wallet_paise: totalWalletPaise,
+        total_promo_paise: totalPromoPaise,
+        balances,
+        entries: entriesRes.rows,
+      };
+    });
+  });
+
   app.get('/users/me/addresses', { preHandler: [authenticate] }, async (req) => {
     const rows = await query(
       `SELECT id, label, address_line_encrypted, locality, city, postal_code, is_default,

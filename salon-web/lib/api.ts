@@ -644,6 +644,52 @@ export function useCustomerStyleVault(enabled = true) {
   });
 }
 
+export interface CustomerLoyaltyPassbook {
+  total_points: number;
+  total_wallet_paise: number;
+  total_promo_paise: number;
+  balances: {
+    salon_id: string;
+    salon_name: string;
+    locality: string;
+    loyalty_points_balance: number;
+    prepaid_purchased_balance_paise: number;
+    prepaid_promo_balance_paise: number;
+    total_visits: number;
+    last_visit_at: string;
+  }[];
+  entries: {
+    id: string;
+    salon_id: string;
+    salon_name: string;
+    locality: string;
+    invoice_id: string | null;
+    invoice_number: string | null;
+    bucket: 'LOYALTY_POINTS' | 'PURCHASED_WALLET_PAISE' | 'PROMO_CREDIT_PAISE';
+    entry_type:
+      | 'EARN_VISIT'
+      | 'REDEEM_CHECKOUT'
+      | 'WALLET_TOPUP'
+      | 'PROMO_BONUS'
+      | 'REFERRAL_REWARD'
+      | 'REFUND_REVERSAL'
+      | 'EXPIRED';
+    amount_delta: number;
+    balance_after: number;
+    notes: string | null;
+    created_at: string;
+  }[];
+}
+
+export function useCustomerLoyaltyLedger(enabled = true, bucket?: string) {
+  return useQuery({
+    queryKey: ['users', 'loyalty-ledger', bucket ?? 'ALL'],
+    queryFn: () =>
+      api<CustomerLoyaltyPassbook>(`/users/me/loyalty-ledger${bucket ? `?bucket=${bucket}` : ''}`),
+    enabled,
+  });
+}
+
 export function usePartnerReviews(enabled = true) {
   return useQuery({
     queryKey: qk.partnerReviews,

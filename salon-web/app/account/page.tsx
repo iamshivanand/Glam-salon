@@ -8,6 +8,7 @@ import {
   useAddAddress,
   useAddresses,
   useConsents,
+  useCustomerLoyaltyLedger,
   useCustomerStyleVault,
   useDeleteAddress,
   useDeleteAccount,
@@ -45,6 +46,7 @@ export default function AccountPage() {
   const uploadStatus = useUploadStatus();
   const payments = usePayments(!!user);
   const styleVault = useCustomerStyleVault(!!user);
+  const loyalty = useCustomerLoyaltyLedger(!!user);
 
   const [form, setForm] = useState({ full_name: '', email: '', gender: '', date_of_birth: '' });
   const [address, setAddress] = useState({
@@ -62,6 +64,7 @@ export default function AccountPage() {
   const [deleteConfirm, setDeleteConfirm] = useState('');
   const [genderOpen, setGenderOpen] = useState(false);
   const genderDropdownRef = useRef<HTMLDivElement>(null);
+  const [ledgerFilter, setLedgerFilter] = useState<'ALL' | 'EARN' | 'REDEEM'>('ALL');
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -430,6 +433,157 @@ export default function AccountPage() {
           {!styleVault.isLoading && (!styleVault.data?.vaults || styleVault.data.vaults.length === 0) && (
             <p className="text-sm opacity-60 py-2">
               No style preferences recorded yet. Once you complete visits at partner salons, your cut specifications and preferred stylists will appear here.
+            </p>
+          )}
+        </div>
+      </section>
+
+      {/* Loyalty Points & Rewards Passbook (Ticket 14 - F1.14) */}
+      <section className="card p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-semibold flex items-center gap-2">
+              <span>⭐</span> Loyalty Points & Rewards Passbook
+            </h2>
+            <p className="text-xs opacity-60 mt-0.5">
+              Earn 1 loyalty point per ₹100 spent on completed visits. Redeem points (1 pt = ₹1) directly at POS checkout.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-accent/15 text-accent font-medium text-xs border border-accent/25">
+              <span>🪙</span>
+              <span>{loyalty.data?.total_points ?? 0} Points Available</span>
+              <span className="opacity-60 text-[10px]">(₹{loyalty.data?.total_points ?? 0} Value)</span>
+            </span>
+            <span
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/5 border border-line text-[11px] opacity-70"
+              title="Phase 2 Dual-Ledger Prepaid Wallet Ready"
+            >
+              <span>💳</span>
+              <span>Wallet: ₹{((loyalty.data?.total_wallet_paise ?? 0) / 100).toFixed(0)}</span>
+            </span>
+          </div>
+        </div>
+
+        {loyalty.isLoading && <p className="text-sm opacity-60">Loading your loyalty ledger…</p>}
+
+        {/* Salon Balance Breakdown */}
+        {(loyalty.data?.balances?.length ?? 0) > 0 && (
+          <div className="space-y-1.5">
+            <span className="text-[11px] uppercase tracking-wider opacity-50 block font-medium">Points by Salon</span>
+            <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-2">
+              {loyalty.data?.balances.map((b) => (
+                <div key={b.salon_id} className="border border-line/60 rounded-xl p-3 bg-surface-raised/20 flex items-center justify-between">
+                  <div className="min-w-0 pr-2">
+                    <p className="text-xs font-medium truncate">{b.salon_name}</p>
+                    <p className="text-[10px] opacity-50 truncate">{b.locality} · {b.total_visits} {b.total_visits === 1 ? 'visit' : 'visits'}</p>
+                  </div>
+                  <span className="text-xs font-semibold text-accent whitespace-nowrap bg-accent/10 px-2 py-0.5 rounded-lg border border-accent/20">
+                    {b.loyalty_points_balance} pts
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Filter Tabs */}
+        <div className="flex items-center justify-between pt-1 border-t border-line/40">
+          <span className="text-xs font-medium opacity-70">Itemized Passbook</span>
+          <div className="flex gap-1 bg-surface-raised/40 p-0.5 rounded-lg border border-line text-xs">
+            <button
+              onClick={() => setLedgerFilter('ALL')}
+              className={`px-2.5 py-0.5 rounded-md transition ${ledgerFilter === 'ALL' ? 'bg-accent text-[#2D1B2E] font-medium' : 'opacity-60 hover:opacity-100'}`}
+            >
+              All
+            </button>
+            <button
+              onClick={() => setLedgerFilter('EARN')}
+              className={`px-2.5 py-0.5 rounded-md transition ${ledgerFilter === 'EARN' ? 'bg-accent text-[#2D1B2E] font-medium' : 'opacity-60 hover:opacity-100'}`}
+            >
+              Earned (+)
+            </button>
+            <button
+              onClick={() => setLedgerFilter('REDEEM')}
+              className={`px-2.5 py-0.5 rounded-md transition ${ledgerFilter === 'REDEEM' ? 'bg-accent text-[#2D1B2E] font-medium' : 'opacity-60 hover:opacity-100'}`}
+            >
+              Redeemed (-)
+            </button>
+          </div>
+        </div>
+
+        {/* Transaction History Feed */}
+        <div className="space-y-2">
+          {(loyalty.data?.entries ?? [])
+            .filter((e) => {
+              if (ledgerFilter === 'EARN') return e.amount_delta > 0;
+              if (ledgerFilter === 'REDEEM') return e.amount_delta < 0;
+              return true;
+            })
+            .map((e) => {
+              const isEarn = e.amount_delta > 0;
+              return (
+                <div
+                  key={e.id}
+                  className="flex items-center justify-between border border-line/50 rounded-xl p-3 text-xs bg-background/40 hover:border-line transition"
+                >
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-sm">{e.salon_name}</span>
+                      <span
+                        className={`text-[10px] px-1.5 py-0.5 rounded font-semibold tracking-wide ${
+                          isEarn
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                            : 'bg-amber-50 text-amber-700 border border-amber-200'
+                        }`}
+                      >
+                        {e.entry_type === 'EARN_VISIT'
+                          ? 'VISIT REWARD'
+                          : e.entry_type === 'REDEEM_CHECKOUT'
+                          ? 'CHECKOUT REDEMPTION'
+                          : e.entry_type.replaceAll('_', ' ')}
+                      </span>
+                    </div>
+                    <p className="opacity-50 text-[11px]">
+                      {new Date(e.created_at).toLocaleDateString('en-IN', {
+                        timeZone: 'Asia/Kolkata',
+                        day: 'numeric',
+                        month: 'short',
+                        year: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                      {e.invoice_number ? ` · ${e.invoice_number}` : ''}
+                      {e.notes ? ` · ${e.notes}` : ''}
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <p className={`font-semibold text-sm ${isEarn ? 'text-emerald-500' : 'text-amber-500'}`}>
+                      {isEarn ? `+${e.amount_delta}` : e.amount_delta} {e.bucket === 'LOYALTY_POINTS' ? 'pts' : 'paise'}
+                    </p>
+                    <p className="text-[10px] opacity-40">
+                      Balance: {e.balance_after} pts
+                    </p>
+                  </div>
+                </div>
+              );
+            })}
+
+          {!loyalty.isLoading &&
+            (loyalty.data?.entries ?? []).filter((e) => {
+              if (ledgerFilter === 'EARN') return e.amount_delta > 0;
+              if (ledgerFilter === 'REDEEM') return e.amount_delta < 0;
+              return true;
+            }).length === 0 &&
+            (loyalty.data?.entries?.length ?? 0) > 0 && (
+              <p className="text-xs opacity-50 italic py-2 text-center">
+                No loyalty transactions match the selected filter.
+              </p>
+            )}
+
+          {!loyalty.isLoading && (!loyalty.data?.entries || loyalty.data.entries.length === 0) && (
+            <p className="text-sm opacity-60 py-3 text-center">
+              No loyalty transactions recorded yet. Complete visits at partner salons to start earning points!
             </p>
           )}
         </div>
