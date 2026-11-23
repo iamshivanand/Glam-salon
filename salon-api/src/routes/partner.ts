@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { one, query, withTenant } from '../db.js';
 import { AppError, parse, badRequest, notFound, forbidden, conflict } from '../http.js';
 import { authenticate, requireRole, salonIdForUser } from '../auth.js';
+import { rateLimit } from '../redis.js';
 import { encrypt } from '../crypto.js';
 import { dashboard } from '../services/analytics.js';
 import { createInvoice } from '../services/invoices.js';
@@ -10,15 +11,26 @@ import { listReminders, triggerReminders } from '../services/reminders.js';
 import { dispatchReminders } from '../services/dispatcher.js';
 import { liveQueue, updateQueueStatus } from '../services/queue.js';
 import { reminderFunnel } from '../services/engagement.js';
-import { listPaymentsForSalon, refundPayment, settlementsForSalon } from '../services/payments.js';
+import {
+  listPaymentsForSalon,
+  payoutsForSalon,
+  refundPayment,
+  settlementsForSalon,
+} from '../services/payments.js';
+import { recordAudit } from '../services/audit.js';
+import { updateBookingStatus } from '../services/booking.js';
+import { isValidGstin, isValidIfsc, isValidPan, normalizeCode } from '../validation.js';
 import { fmtLocalDate } from '../services/availability.js';
 import { invalidateSalonProfileCache } from '../services/discovery.js';
-import { updateBookingStatus } from '../services/booking.js';
 import { redis } from '../redis.js';
 import { presignGet, presignPut, publicUrlFor, buildObjectKey, storageConfigured } from '../services/storage.js';
 
-const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'] as const;
+// STAFF deliberately sits outside the partner console: they get a narrow
+// self-service surface (their own shift and assigned bookings) instead of
+// access to revenue, CRM, marketing and payment controls.
+const PARTNER_ROLES = ['SALON_OWNER', 'SALON_MANAGER', 'PLATFORM_ADMIN'] as const;
 const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
+const STAFF_ROLES = ['STAFF'] as const;
 
 async function resolveSalonId(req: any): Promise<string> {
   const paramOrHeader = req.params?.id ?? req.headers['x-salon-id'];
@@ -28,13 +40,44 @@ async function resolveSalonId(req: any): Promise<string> {
       `SELECT id FROM salons WHERE id = $1 AND (owner_id = $2 OR $3 = 'PLATFORM_ADMIN')`,
       [requested, req.auth.id, req.auth.role],
     );
-    if (!owned) throw forbidden('You do not manage this salon');
+    if (owned) return requested;
+    const linked = await one(
+      `SELECT salon_id FROM staff_members
+        WHERE salon_id = $1 AND user_id = $2 AND is_active LIMIT 1`,
+      [requested, req.auth.id],
+    );
+    if (!linked) throw forbidden('You do not manage this salon');
     return requested;
   }
   if (req.auth.salonId) return req.auth.salonId;
   const resolved = await salonIdForUser(req.auth.id);
   if (!resolved) throw forbidden('No salon is linked to this account yet');
   return resolved;
+}
+
+async function resolveStaffMembership(req: any): Promise<{
+  id: string;
+  salon_id: string;
+  display_name: string;
+  specialization: string | null;
+}> {
+  const member = await one<{
+    id: string;
+    salon_id: string;
+    display_name: string;
+    specialization: string | null;
+  }>(
+    `SELECT id, salon_id, display_name, specialization
+       FROM staff_members
+      WHERE user_id = $1
+        AND is_active = TRUE
+        AND ($2::uuid IS NULL OR salon_id = $2)
+      ORDER BY created_at
+      LIMIT 1`,
+    [req.auth.id, req.auth.salonId ?? null],
+  );
+  if (!member) throw forbidden('This account is not linked to an active staff record');
+  return member;
 }
 
 function slugify(name: string): string {
@@ -80,10 +123,21 @@ const SalonPatch = SalonCreate.partial().extend({
 });
 
 const KycInput = z.object({
-  pan_number: z.string().min(10).max(10),
-  gstin: z.string().max(20).optional(),
-  bank_account_number: z.string().min(6).max(34),
-  bank_ifsc: z.string().min(4).max(16),
+  pan_number: z
+    .string()
+    .transform(normalizeCode)
+    .refine(isValidPan, 'PAN must look like ABCDE1234F'),
+  gstin: z
+    .string()
+    .transform(normalizeCode)
+    .refine((value) => value === '' || isValidGstin(value), 'GSTIN must be a 15-character GST number')
+    .optional()
+    .transform((value) => (value ? value : undefined)),
+  bank_account_number: z.string().regex(/^\d{6,20}$/, 'Bank account number must be 6-20 digits'),
+  bank_ifsc: z
+    .string()
+    .transform(normalizeCode)
+    .refine(isValidIfsc, 'IFSC must look like HDFC0001234'),
   shop_license_s3_key: z.string().max(512).optional(),
 });
 
@@ -206,7 +260,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
                 AND b.scheduled_start_at >= NOW() AND b.status IN ('REQUESTED','CONFIRMED','ARRIVED','IN_SERVICE')
               ) AS upcoming_bookings
          FROM salons s
-        WHERE ($2 = 'PLATFORM_ADMIN' OR s.owner_id = $1)
+        WHERE ($2 = 'PLATFORM_ADMIN'
+               OR s.owner_id = $1
+               OR EXISTS (SELECT 1 FROM staff_members sm
+                           WHERE sm.salon_id = s.id AND sm.user_id = $1 AND sm.is_active))
         ORDER BY s.created_at`,
       [req.auth!.id, req.auth!.role],
     );
@@ -275,15 +332,46 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     const salonId = await resolveSalonId(req);
     const kyc = await one(`SELECT id FROM salon_kyc_verifications WHERE salon_id = $1`, [salonId]);
     if (!kyc) throw badRequest('KYC_REQUIRED', 'Submit PAN, bank details and shop licence before verification');
-    return one(
-      `UPDATE salons SET verification_status = 'SUBMITTED' WHERE id = $1 RETURNING id, verification_status`,
+    const updated = await one(
+      `UPDATE salons SET verification_status = 'SUBMITTED'
+        WHERE id = $1 AND verification_status IN ('DRAFT', 'REJECTED')
+        RETURNING id, verification_status`,
       [salonId],
     );
+    if (!updated) {
+      const current = await one<{ verification_status: string }>(
+        `SELECT verification_status FROM salons WHERE id = $1`,
+        [salonId],
+      );
+      throw conflict(
+        'INVALID_STATUS',
+        current?.verification_status === 'APPROVED'
+          ? 'This salon is already approved'
+          : `Cannot submit a salon with status ${current?.verification_status ?? 'unknown'}`,
+      );
+    }
+    return updated;
   });
 
   app.post('/partner/kyc', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
     const body = parse(KycInput, req.body);
+
+    if (body.shop_license_s3_key) {
+      const upload = await one<{ purpose: string; status: string; salon_id: string | null }>(
+        `SELECT purpose, status, salon_id FROM uploads WHERE s3_key = $1 AND user_id = $2`,
+        [body.shop_license_s3_key, req.auth!.id],
+      );
+      if (
+        !upload ||
+        upload.purpose !== 'kyc_document' ||
+        upload.status !== 'UPLOADED' ||
+        upload.salon_id !== salonId
+      ) {
+        throw badRequest('INVALID_KEY', 'Shop licence must be a confirmed KYC upload for this salon');
+      }
+    }
+
     const row = await one(
       `INSERT INTO salon_kyc_verifications
          (salon_id, pan_number_encrypted, gstin, bank_account_encrypted, bank_ifsc,
@@ -294,22 +382,40 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
          gstin = EXCLUDED.gstin,
          bank_account_encrypted = EXCLUDED.bank_account_encrypted,
          bank_ifsc = EXCLUDED.bank_ifsc,
-         shop_license_s3_key = EXCLUDED.shop_license_s3_key,
+         shop_license_s3_key = COALESCE(EXCLUDED.shop_license_s3_key, salon_kyc_verifications.shop_license_s3_key),
          status = 'SUBMITTED',
          rejection_reason = NULL
        RETURNING id, gstin, bank_ifsc, shop_license_s3_key, status, updated_at`,
       [
         salonId,
-        encrypt(body.pan_number.toUpperCase()),
+        encrypt(body.pan_number),
         body.gstin ?? null,
         encrypt(body.bank_account_number),
-        body.bank_ifsc.toUpperCase(),
+        body.bank_ifsc,
         body.shop_license_s3_key ?? null,
       ],
     );
-    await query(`UPDATE salons SET verification_status = 'SUBMITTED' WHERE id = $1 AND verification_status = 'DRAFT'`, [
+
+    // Re-submission after a rejection must put the salon back in the review
+    // queue. An approved salon keeps its status so it stays discoverable while
+    // bank-detail updates are reviewed.
+    await query(
+      `UPDATE salons SET verification_status = 'SUBMITTED'
+        WHERE id = $1 AND verification_status IN ('DRAFT', 'REJECTED')`,
+      [salonId],
+    );
+
+    await recordAudit({
+      actorId: req.auth!.id,
+      actorRole: req.auth!.role,
       salonId,
-    ]);
+      action: 'kyc.submitted',
+      entityType: 'salon_kyc_verification',
+      entityId: salonId,
+      metadata: { has_shop_licence: Boolean(body.shop_license_s3_key) },
+      ip: req.ip,
+    });
+
     return row;
   });
 
@@ -744,6 +850,82 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true, mapped: body.service_ids.length };
   });
 
+  // ---------- Staff self-service ----------
+  // A staff login sees only its own shift, assigned bookings and the status
+  // transitions it is allowed to drive. Revenue, CRM, marketing, billing and
+  // payment controls stay behind PARTNER_ROLES.
+  app.get('/partner/me/staff', { preHandler: [authenticate, requireRole(...STAFF_ROLES)] }, async (req) => {
+    const member = await resolveStaffMembership(req);
+    const salon = await one(
+      `SELECT id, name, slug, address_line, locality, city FROM salons WHERE id = $1`,
+      [member.salon_id],
+    );
+    const schedule = await query(
+      `SELECT day_of_week, override_date, shift_start, shift_end, breaks_json, is_working_day
+         FROM staff_schedules
+        WHERE staff_id = $1
+        ORDER BY override_date NULLS LAST, day_of_week`,
+      [member.id],
+    );
+    return { staff: member, salon, schedule, today: fmtLocalDate(new Date()) };
+  });
+
+  app.get('/partner/me/bookings', { preHandler: [authenticate, requireRole(...STAFF_ROLES)] }, async (req) => {
+    const member = await resolveStaffMembership(req);
+    const q = parse(z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }), req.query);
+    const date = q.date ?? fmtLocalDate(new Date());
+    const bookings = await query(
+      `SELECT b.id, b.booking_code, b.status, b.scheduled_start_at, b.scheduled_end_at,
+              b.total_payable_paise, b.checkin_pin, b.customer_notes,
+              u.full_name AS customer_name,
+              COALESCE(json_agg(json_build_object(
+                'id', bi.id, 'service_name', bi.service_name_snapshot,
+                'start_at', lower(bi.time_range), 'end_at', upper(bi.time_range),
+                'price_paise', bi.unit_price_paise, 'status', bi.status
+              ) ORDER BY bi.time_range) FILTER (WHERE bi.id IS NOT NULL), '[]') AS items
+         FROM bookings b
+         JOIN users u ON u.id = b.customer_id
+         JOIN booking_items bi ON bi.booking_id = b.id AND bi.staff_id = $1
+        WHERE b.scheduled_start_at >= ($2::date::timestamp AT TIME ZONE 'Asia/Kolkata')
+          AND b.scheduled_start_at <  (($2::date + 1)::timestamp AT TIME ZONE 'Asia/Kolkata')
+        GROUP BY b.id, u.full_name
+        ORDER BY b.scheduled_start_at`,
+      [member.id, date],
+    );
+    return { date, bookings };
+  });
+
+  app.patch('/partner/me/bookings/:id/status', { preHandler: [authenticate, requireRole(...STAFF_ROLES)] }, async (req) => {
+    const member = await resolveStaffMembership(req);
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        status: z.enum([
+          'CONFIRMED',
+          'DECLINED',
+          'ARRIVED',
+          'IN_SERVICE',
+          'COMPLETED',
+          'NO_SHOW',
+          'CANCELLED_BY_SALON',
+        ]),
+        checkin_pin: z.string().regex(/^\d{4}$/).optional(),
+      }),
+      req.body,
+    );
+    const assigned = await one(
+      `SELECT 1 FROM booking_items WHERE booking_id = $1 AND staff_id = $2 LIMIT 1`,
+      [id, member.id],
+    );
+    if (!assigned) throw forbidden('This booking is not assigned to you');
+    return updateBookingStatus({
+      bookingId: id,
+      auth: req.auth!,
+      status: body.status,
+      checkinPin: body.checkin_pin,
+    });
+  });
+
   app.get('/partner/resources', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
     const resources = await query(`SELECT * FROM salon_resources WHERE salon_id = $1 ORDER BY name`, [salonId]);
@@ -926,6 +1108,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/partner/payments/:id/refund', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
+    const refundLimit = await rateLimit(`payment:refund:${salonId}`, 10, 600);
+    if (!refundLimit.allowed) {
+      throw new AppError(429, 'RATE_LIMITED', 'Too many refund attempts. Try again in a few minutes.');
+    }
     const { id } = req.params as { id: string };
     const body = parse(
       z.object({
@@ -934,13 +1120,23 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       }),
       req.body ?? {},
     );
+    const header = req.headers['idempotency-key'];
     return refundPayment({
       salonId,
       paymentId: id,
       amountPaise: body.amount_paise,
       reason: body.reason,
       actorId: req.auth!.id,
+      actorRole: req.auth!.role,
+      idempotencyKey: typeof header === 'string' ? header : undefined,
+      ip: req.ip,
     });
+  });
+
+  app.get('/partner/payouts', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+    const salonId = await resolveSalonId(req);
+    const q = parse(z.object({ limit: z.coerce.number().int().min(1).max(100).optional() }), req.query);
+    return { payouts: await payoutsForSalon(salonId, q.limit ?? 24) };
   });
 
   app.get('/partner/settlements', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {

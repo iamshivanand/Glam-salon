@@ -42,7 +42,7 @@ Verify the backend:
 
 ```powershell
 cd salon-api
-npm run smoke          # 26 end-to-end checks
+npm run smoke          # 55 end-to-end checks
 ```
 
 ## Demo accounts
@@ -52,6 +52,8 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 | Role           | Phone           |
 | -------------- | --------------- |
 | Salon owner    | `+919800000001` |
+| Salon manager  | `+919800000005` |
+| Staff          | `+919800000006` |
 | Customer       | `+919800000002` |
 | Customer       | `+919800000003` |
 | Customer       | `+919800000004` |
@@ -64,6 +66,8 @@ Sign-in is phone + OTP. In development the API returns the OTP and the web modal
 - Booking creation and invoicing require an `Idempotency-Key`.
 - The API connects as the least-privilege `glam_app` role; CRM and reminder tables are
   protected by `FORCE ROW LEVEL SECURITY` and a per-request `app.current_salon_id` GUC.
+- Refund and payout records are tenant-isolated the same way, and refunds are idempotent on
+  `Idempotency-Key`.
 - All routes are versioned under `/api/v1` and errors use `{ error: { code, message } }`.
 - Notifications go through one provider layer. `NOTIFICATION_PROVIDER=auto` wires Twilio
   SMS/WhatsApp, Meta WhatsApp Cloud, Resend email and/or a generic webhook from credentials
@@ -81,19 +85,29 @@ replies, multi-salon switching, customer account settings, owner onboarding/KYC,
 admin KYC/commission console, transactional booking/queue/invoice messages, and partner
 settlements. The web app and the Expo app both run against the live API.
 
-Implemented but **not verified** here because no credentials are configured: real Twilio,
-Meta WhatsApp Cloud and Resend delivery, Razorpay payments/refunds, and S3 uploads. Local and
-CI runs use the console notification provider, `PAYMENT_PROVIDER=manual` (records intent
-only) and report storage as unconfigured. Nothing in the UI claims a message or payment was
-delivered when the provider was not configured.
+The hardening pass adds: validated PAN/GSTIN/IFSC with correct KYC resubmission state, a
+registry-backed two-step upload flow (declared type/size signed into the URL, HEAD verification
+at confirm), idempotent refunds with a ledger and audit trail, manually recorded settlement
+payouts, platform admin salon/user controls with an append-only audit log, customer account
+deletion plus consent history and session management, and Expo push registration on mobile.
+
+Implemented but **not fully verified** here: real Twilio, Meta WhatsApp Cloud and Resend
+delivery, Razorpay refund execution, live webhook delivery and S3 uploads. Razorpay
+test-mode order creation, intent idempotency and checkout-signature verification **have**
+been exercised with test keys, and webhook capture/refund handling is verified with locally
+signed payloads. Local and CI runs use the console notification provider and report storage
+as unconfigured; `PAYMENT_PROVIDER` is `manual` by default and `razorpay` only when keys are
+present. Nothing in the UI claims a message or payment was delivered when the provider was
+not configured.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs typechecks, API unit tests and the
 production web build, then migrates, seeds and smoke-tests a PostGIS + Redis stack on every
 push. `.github/workflows/release.yml` builds and pushes API/web images to GHCR on a `v*` tag.
 
 Still not implemented: OpenSearch, BullMQ/n8n workers, a durable reminder queue (dispatch is
-an in-process interval or `npm run dispatch`), and an in-app push prompt on mobile
-(`expo-notifications` is not installed; the API side resolves registered Expo tokens).
+an in-process interval or `npm run dispatch`), and real vendor delivery/payment/storage
+execution without credentials. The mobile app now requests push permission after login and
+registers an Expo token, but it has not been exercised on a physical device or emulator here.
 
 See `salon-api/README.md`, `salon-web/README.md` and `ops/README.md` for details.
 

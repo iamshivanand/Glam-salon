@@ -46,20 +46,8 @@ function stripWhatsAppPrefix(value: string): string {
  * provider signature before touching data.
  */
 export const publicRoutes: FastifyPluginAsync = async (app) => {
-  // Keep the raw body so provider HMACs can be checked byte-for-byte.
-  app.addContentTypeParser(
-    ['application/json', 'application/*+json'],
-    { parseAs: 'string' },
-    (req, body, done) => {
-      (req as any).rawBody = body;
-      if (!body) return done(null, {});
-      try {
-        done(null, JSON.parse(body as string));
-      } catch (err) {
-        done(err as Error, undefined);
-      }
-    },
-  );
+  // The JSON parser (with rawBody for provider HMACs) is registered globally in
+  // index.ts. Only form payloads still need their own parser here.
   app.addContentTypeParser(
     'application/x-www-form-urlencoded',
     { parseAs: 'string' },

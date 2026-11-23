@@ -5,6 +5,7 @@ import { useAuth } from '@/lib/store';
 import {
   rupees,
   usePartnerPayments,
+  usePartnerPayouts,
   usePartnerSettlements,
   usePaymentCapabilities,
   useRefundPayment,
@@ -27,6 +28,7 @@ export default function SettlementsPage() {
 
   const settlements = usePartnerSettlements(from, to, !!user);
   const payments = usePartnerPayments(!!user);
+  const payouts = usePartnerPayouts(!!user);
   const capabilities = usePaymentCapabilities();
   const refund = useRefundPayment();
 
@@ -51,8 +53,8 @@ export default function SettlementsPage() {
       <div>
         <h1 className="font-display text-4xl">Settlements</h1>
         <p className="text-sm opacity-60 mt-1">
-          Commission and partner payout computed from captured invoices (Asia/Kolkata days). Payout execution
-          depends on the configured payment provider.
+          Commission and partner payout computed from captured invoices (Asia/Kolkata days). Platform admins record
+          the actual bank transfer under Platform → Record a payout.
         </p>
       </div>
 
@@ -89,6 +91,32 @@ export default function SettlementsPage() {
           </div>
         ))}
       </div>
+
+      <section className="card p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="font-semibold">Recorded payouts</h2>
+            <p className="text-xs opacity-60">Transfers recorded by the platform team.</p>
+          </div>
+          <p className="text-sm">
+            <b>{rupees((payouts.data?.payouts ?? []).reduce((sum, p) => sum + Number(p.amount_paise), 0))}</b>
+            <span className="text-xs opacity-60"> across {payouts.data?.payouts.length ?? 0} transfers</span>
+          </p>
+        </div>
+        <div className="mt-3 space-y-1">
+          {(payouts.data?.payouts ?? []).map((p) => (
+            <div key={p.id} className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2 text-sm">
+              <span>{p.period_start} → {p.period_end}</span>
+              <span>{rupees(Number(p.amount_paise))}</span>
+              <span className="text-xs opacity-60">{p.reference ?? 'no reference'}</span>
+              <span className="text-xs opacity-50">
+                {new Date(p.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
+              </span>
+            </div>
+          ))}
+          {!payouts.data?.payouts.length && <p className="text-sm opacity-60">No payouts recorded yet.</p>}
+        </div>
+      </section>
 
       <div className="card overflow-x-auto">
         <table className="w-full text-sm min-w-[720px]">
@@ -145,7 +173,7 @@ export default function SettlementsPage() {
                 <td><span className="chip !py-0.5 !px-2">{p.status}</span></td>
                 <td className="text-xs opacity-60">{p.booking_id ? p.booking_id.slice(0, 8) : '—'}</td>
                 <td className="pr-3 text-right">
-                  {p.status === 'PAID' && (
+                  {(p.status === 'PAID' || p.status === 'PARTIALLY_REFUNDED') && (
                     <button onClick={() => doRefund(p.id, Number(p.amount_paise))} className="chip !py-1 !px-3" disabled={refund.isPending}>
                       Refund
                     </button>

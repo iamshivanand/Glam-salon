@@ -5,7 +5,7 @@ import { one, query, tx, withUser } from '../db.js';
 import { redis, rateLimit } from '../redis.js';
 import { blindIndex, encrypt, decrypt, maskPhone, otpCode, hashOtp, uuid, sha256 } from '../crypto.js';
 import { AppError, parse, badRequest, unauthorized, notFound, conflict, forbidden } from '../http.js';
-import { authenticate, issueTokens, rotateRefresh, revokeRefresh } from '../auth.js';
+import { authenticate, issueTokens, rotateRefresh, revokeAllRefreshForUser, revokeRefresh, salonIdForUser } from '../auth.js';
 import { env, devReturnOtp, isDev } from '../env.js';
 import { sendOtpCode } from '../services/notifications.js';
 
@@ -134,19 +134,23 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       await query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id]);
     }
 
-    const salon = await one<{ id: string }>(`SELECT id FROM salons WHERE owner_id = $1 ORDER BY created_at LIMIT 1`, [
-      user!.id,
-    ]);
+    const salonId = await salonIdForUser(user!.id);
 
     const tokens = await issueTokens(
-      { id: user!.id, role: user!.role, salonId: salon?.id ?? null },
+      { id: user!.id, role: user!.role, salonId },
       { ip: req.ip, deviceFingerprint: body.device_fingerprint },
     );
     setRefreshCookie(reply, tokens.refresh_token);
 
     return {
       ...tokens,
-      user: { id: user!.id, full_name: user!.full_name, role: user!.role, salon_id: salon?.id ?? null },
+      user: {
+        id: user!.id,
+        full_name: user!.full_name,
+        role: user!.role,
+        salon_id: salonId,
+        phone: challenge.phone,
+      },
     };
   });
 
@@ -302,6 +306,12 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
        RETURNING *`,
       [req.auth!.id, body.salon_id ?? null, body.channel, body.purpose, body.is_granted, req.ip],
     );
+    await query(
+      `INSERT INTO customer_consent_events
+         (user_id, salon_id, channel, purpose, is_granted, source, ip_address)
+       VALUES ($1,$2,$3,$4,$5,'ACCOUNT',$6)`,
+      [req.auth!.id, body.salon_id ?? null, body.channel, body.purpose, body.is_granted, req.ip],
+    );
     return row;
   });
 
@@ -426,6 +436,19 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     });
   });
 
+  app.get('/users/me/consents/history', { preHandler: [authenticate] }, async (req) => {
+    const q = parse(z.object({ limit: z.coerce.number().int().min(1).max(200).optional() }), req.query);
+    const rows = await query(
+      `SELECT id, salon_id, channel, purpose, is_granted, source, created_at
+         FROM customer_consent_events
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [req.auth!.id, q.limit ?? 50],
+    );
+    return { events: rows };
+  });
+
   app.get('/users/me/addresses', { preHandler: [authenticate] }, async (req) => {
     const rows = await query(
       `SELECT id, label, address_line_encrypted, locality, city, postal_code, is_default,
@@ -540,5 +563,153 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       await client.query(`UPDATE user_refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
     });
     return { status: 'ANONYMIZATION_SCHEDULED', purge_eta_hrs: 24 };
+  });
+
+  app.get('/users/me/sessions', { preHandler: [authenticate] }, async (req) => {
+    const rows = await query(
+      `SELECT id, device_fingerprint, host(ip_address) AS ip_address, expires_at, created_at
+         FROM user_refresh_tokens
+        WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [req.auth!.id],
+    );
+    return { sessions: rows };
+  });
+
+  app.post('/users/me/sessions/revoke-all', { preHandler: [authenticate] }, async (req, reply) => {
+    const revoked = await revokeAllRefreshForUser(req.auth!.id);
+    reply.clearCookie('gc_refresh', { path: '/api/v1/auth' });
+    return { revoked };
+  });
+
+  app.post('/users/me/sessions/:id/revoke', { preHandler: [authenticate] }, async (req) => {
+    const { id } = parse(z.object({ id: z.string().uuid() }), req.params);
+    const rows = await query<{ id: string }>(
+      `UPDATE user_refresh_tokens
+          SET revoked_at = NOW()
+        WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+        RETURNING id`,
+      [id, req.auth!.id],
+    );
+    if (!rows.length) throw notFound('Session not found');
+    return { revoked: 1 };
+  });
+
+  /**
+   * DPDP data portability: everything tied to this account in one JSON file.
+   * Direct identifiers are included because the caller just authenticated as
+   * the owner; internal blind indexes and token hashes never leave the API.
+   */
+  app.get('/users/me/export', { preHandler: [authenticate] }, async (req) => {
+    const userId = req.auth!.id;
+    const exportLimit = await rateLimit(`me:export:${userId}`, 5, 600);
+    if (!exportLimit.allowed) {
+      throw new AppError(429, 'RATE_LIMITED', 'Too many data export requests. Try again later.');
+    }
+
+    const profile = await one<Record<string, unknown> & { phone_e164_encrypted: Buffer }>(
+      `SELECT * FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (!profile) throw notFound('Account not found');
+    const { phone_e164_encrypted, phone_blind_index: _blindIndex, ...rest } = profile;
+    const phone = decrypt(phone_e164_encrypted);
+
+    const [addresses, bookings, invoices, reviews, consents] = await Promise.all([
+      query(
+        `SELECT id, label, locality, city, postal_code, is_default, created_at
+           FROM user_addresses WHERE user_id = $1 ORDER BY created_at`,
+        [userId],
+      ),
+      query(
+        `SELECT b.booking_code, b.status, b.mode, b.channel,
+                b.scheduled_start_at, b.scheduled_end_at,
+                b.subtotal_paise, b.discount_paise, b.tax_paise, b.booking_fee_paise,
+                b.total_payable_paise, b.customer_notes, b.cancellation_reason, b.created_at,
+                s.name AS salon_name, s.locality, s.city,
+                COALESCE((
+                  SELECT json_agg(json_build_object(
+                    'service', bi.service_name_snapshot,
+                    'price_paise', bi.unit_price_paise,
+                    'duration_mins', bi.duration_mins,
+                    'status', bi.status::text
+                  ) ORDER BY bi.time_range)
+                  FROM booking_items bi WHERE bi.booking_id = b.id
+                ), '[]'::json) AS items
+           FROM bookings b
+           JOIN salons s ON s.id = b.salon_id
+          WHERE b.customer_id = $1
+          ORDER BY b.created_at DESC`,
+        [userId],
+      ),
+      query(
+        `SELECT invoice_number, booking_id, gross_amount_paise, discount_paise,
+                tax_paise, net_collected_paise, method, status, created_at
+           FROM invoices_and_payments
+          WHERE customer_id = $1
+          ORDER BY created_at DESC`,
+        [userId],
+      ),
+      query(
+        `SELECT booking_id, overall_rating, hygiene_rating, review_text, owner_reply, created_at
+           FROM reviews WHERE customer_id = $1 ORDER BY created_at DESC`,
+        [userId],
+      ),
+      query(
+        `SELECT salon_id, channel, purpose, is_granted, updated_at
+           FROM customer_consents WHERE user_id = $1 ORDER BY updated_at DESC`,
+        [userId],
+      ),
+    ]);
+
+    return {
+      exported_at: new Date().toISOString(),
+      profile: { ...rest, phone },
+      addresses,
+      bookings,
+      invoices,
+      reviews,
+      consents,
+    };
+  });
+
+  /**
+   * DPDP erasure request. The account is soft-deleted so bookings, invoices and
+   * audit records keep their referential integrity; direct identifiers are
+   * removed and every session is revoked.
+   */
+  app.delete('/users/me', { preHandler: [authenticate] }, async (req, reply) => {
+    const id = req.auth!.id;
+    if (req.auth!.role === 'PLATFORM_ADMIN') {
+      throw forbidden('Platform admin accounts cannot be deleted from the app');
+    }
+    const activeBookings = await one<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM bookings
+        WHERE customer_id = $1 AND status IN ('REQUESTED', 'CONFIRMED', 'ARRIVED', 'IN_SERVICE')`,
+      [id],
+    );
+    if (Number(activeBookings?.count ?? 0) > 0) {
+      throw conflict('ACTIVE_BOOKINGS', 'Cancel your upcoming bookings before deleting your account');
+    }
+
+    await query(
+      `UPDATE users
+          SET status = 'DELETED',
+              deleted_at = NOW(),
+              full_name = 'Deleted user',
+              email = NULL,
+              avatar_s3_key = NULL,
+              emergency_contacts_json = NULL,
+              phone_e164_encrypted = $2
+        WHERE id = $1`,
+      [id, encrypt('')],
+    );
+    await query(`DELETE FROM user_addresses WHERE user_id = $1`, [id]);
+    await query(`DELETE FROM device_push_tokens WHERE user_id = $1`, [id]);
+    await query(`UPDATE customer_consents SET is_granted = FALSE WHERE user_id = $1`, [id]);
+    await revokeAllRefreshForUser(id);
+    reply.clearCookie('gc_refresh', { path: '/api/v1/auth' });
+    return { ok: true, deleted_at: new Date().toISOString() };
   });
 };

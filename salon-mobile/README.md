@@ -36,8 +36,11 @@ the code and the sheet fills it in.
 | -------------- | --------------- |
 | Customer       | `+919800000002` |
 | Salon owner    | `+919800000001` |
+| Salon manager  | `+919800000005` |
+| Staff          | `+919800000006` |
 
-The sheet also has one-tap chips for these demo accounts.
+The sheet also has one-tap chips for these demo accounts. Staff sign in to the same Admin tab
+but see only their own shift and assigned bookings.
 
 ## Tabs
 
@@ -60,9 +63,12 @@ OTP sheet and, once verified, automatically completes the hold and booking.
 - `api.ts` is the whole network layer: OTP, discovery, availability, hold/create/cancel,
   partner dashboard, day book, queue, status transitions, invoicing, CRM, reminder funnel,
   settlements, reviews and device-token registration.
-- Push delivery is implemented server-side (Expo Push API) and the app can register a token via
-  `POST /users/me/devices`. Shipping the notification prompt itself needs `expo-notifications`,
-  which is not installed in this workspace.
+- Push delivery is implemented server-side (Expo Push API). After login the app requests
+  permission with `expo-notifications`, creates an Android channel, resolves the Expo project
+  id and registers the token via `POST /users/me/devices`; tapping a reminder opens the Visits
+  tab. Registration is best-effort and silently no-ops on simulators without a device token.
+  It is typechecked but has not been exercised on a physical device here (no emulator/device
+  in this workspace).
 - Charts are plain progress bars rather than Victory, so there is no extra native dependency.
 - Expo web export still fails on NativeBase / React Aria transitive web dependencies. Use
   `salon-web` for the browser and a native simulator/device for this app.

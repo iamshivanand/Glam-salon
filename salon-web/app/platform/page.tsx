@@ -3,17 +3,32 @@
 import Link from 'next/link';
 import { useState } from 'react';
 import {
+  fetchKycDocumentUrl,
   rupees,
+  useAdminAudit,
   useAdminDisputes,
   useAdminKyc,
   useAdminSalons,
   useAdminStats,
   useAdminUsers,
+  useRecordPayout,
   useReviewKyc,
+  useSetSalonStatus,
+  useUpdateAdminUser,
   useUpdateCommission,
   useUpdateDispute,
 } from '@/lib/api';
 import { useAuth, useAuthModal } from '@/lib/store';
+
+function monthStart(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+}
+
+function todayIso(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
 
 export default function PlatformPage() {
   const { user, hydrated } = useAuth();
@@ -28,9 +43,20 @@ export default function PlatformPage() {
   const [disputeFilter, setDisputeFilter] = useState<'OPEN_ALERT' | 'ESCALATED' | 'RESOLVED' | 'ALL'>('OPEN_ALERT');
   const disputes = useAdminDisputes(disputeFilter, isAdmin);
   const updateDispute = useUpdateDispute();
+  const salonStatus = useSetSalonStatus();
+  const adminUser = useUpdateAdminUser();
+  const payout = useRecordPayout();
+  const audit = useAdminAudit(isAdmin);
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [reasons, setReasons] = useState<Record<string, string>>({});
+  const [payoutForm, setPayoutForm] = useState({
+    salonId: '',
+    period_start: monthStart(),
+    period_end: todayIso(),
+    amount: '',
+    reference: '',
+  });
 
   if (!hydrated) return <div className="card p-8 mt-8">Checking your session…</div>;
   if (!user) {
@@ -82,6 +108,64 @@ export default function PlatformPage() {
     try {
       await updateDispute.mutateAsync({ id, resolution_status });
       setNotice(`Dispute status updated to ${resolution_status.toLowerCase().replaceAll('_', ' ')}.`);
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const toggleSalon = async (salonId: string, isActive: boolean) => {
+    setNotice(null);
+    setProblem(null);
+    const reason = isActive ? undefined : window.prompt('Why is this salon being deactivated?') ?? undefined;
+    try {
+      await salonStatus.mutateAsync({ salonId, is_active: isActive, reason });
+      setNotice(isActive ? 'Salon activated.' : 'Salon deactivated.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const changeUser = async (
+    userId: string,
+    body: { status?: 'ACTIVE' | 'SUSPENDED' | 'DELETED'; role?: string },
+  ) => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      await adminUser.mutateAsync({ userId, ...body });
+      setNotice('User updated.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const viewDocument = async (salonId: string) => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      const url = await fetchKycDocumentUrl(salonId);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const savePayout = async () => {
+    setNotice(null);
+    setProblem(null);
+    if (!payoutForm.salonId) return setProblem('Choose a salon for this payout.');
+    const amount = Math.round(Number(payoutForm.amount) * 100);
+    if (!Number.isFinite(amount) || amount <= 0) return setProblem('Enter a payout amount in rupees.');
+    try {
+      await payout.mutateAsync({
+        salonId: payoutForm.salonId,
+        period_start: payoutForm.period_start,
+        period_end: payoutForm.period_end,
+        amount_paise: amount,
+        reference: payoutForm.reference || undefined,
+      });
+      setNotice('Payout recorded.');
+      setPayoutForm({ ...payoutForm, amount: '', reference: '' });
     } catch (err: any) {
       setProblem(err.message);
     }
@@ -148,7 +232,15 @@ export default function PlatformPage() {
                 <td className="p-3 font-medium">{row.salon_name}</td>
                 <td>{row.gstin ?? '—'}</td>
                 <td>{row.bank_ifsc}</td>
-                <td className="text-xs opacity-60 max-w-[180px] truncate">{row.shop_license_s3_key ?? 'not uploaded'}</td>
+                <td className="text-xs opacity-60 max-w-[180px]">
+                  {row.shop_license_s3_key ? (
+                    <button onClick={() => viewDocument(row.salon_id)} className="underline">
+                      View document
+                    </button>
+                  ) : (
+                    'not uploaded'
+                  )}
+                </td>
                 <td><span className="chip !py-0.5 !px-2">{row.kyc_status}</span></td>
                 <td className="py-2 pr-3">
                   <div className="flex flex-wrap gap-1">
@@ -289,12 +381,13 @@ export default function PlatformPage() {
         <div className="p-5 pb-0">
           <h2 className="font-semibold">Salons</h2>
         </div>
-        <table className="w-full text-sm min-w-[820px] mt-3">
+        <table className="w-full text-sm min-w-[940px] mt-3">
           <thead>
             <tr className="text-left opacity-60">
               <th className="p-3">Salon</th>
               <th>Owner</th>
               <th>Status</th>
+              <th>Live</th>
               <th>Rating</th>
               <th>Marketplace commission</th>
             </tr>
@@ -308,6 +401,15 @@ export default function PlatformPage() {
                 </td>
                 <td>{s.owner_name}</td>
                 <td><span className="chip !py-0.5 !px-2">{s.verification_status}</span></td>
+                <td>
+                  <button
+                    onClick={() => toggleSalon(s.id, !s.is_active)}
+                    disabled={salonStatus.isPending}
+                    className="chip !py-0.5 !px-2"
+                  >
+                    {s.is_active ? 'Active' : 'Paused'}
+                  </button>
+                </td>
                 <td>★ {Number(s.avg_rating ?? 0).toFixed(1)} ({s.review_count})</td>
                 <td>
                   <div className="flex items-center gap-2">
@@ -336,14 +438,100 @@ export default function PlatformPage() {
 
       <section className="card p-5">
         <h2 className="font-semibold">Recent users</h2>
+        <p className="text-xs opacity-60 mt-1">
+          Role changes take effect on the next sign-in. Suspending an account revokes all its sessions immediately.
+        </p>
         <div className="mt-3 space-y-1">
           {(users.data?.users ?? []).slice(0, 12).map((u: any) => (
-            <div key={u.id} className="flex items-center justify-between border-t border-line pt-1 text-sm">
-              <span>{u.full_name}</span>
-              <span className="text-xs opacity-60">{u.role}</span>
+            <div key={u.id} className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2 text-sm">
+              <span className="min-w-[140px]">{u.full_name}</span>
+              <span className="text-xs opacity-60">{u.email ?? 'no email'}</span>
+              <select
+                value={u.role}
+                disabled={u.id === user.id || adminUser.isPending}
+                onChange={(e) => changeUser(u.id, { role: e.target.value })}
+                className="border border-line rounded-xl px-2 py-1 bg-transparent text-xs"
+              >
+                {['CUSTOMER', 'SALON_OWNER', 'SALON_MANAGER', 'STAFF', 'PLATFORM_ADMIN'].map((role) => (
+                  <option key={role} value={role}>{role}</option>
+                ))}
+              </select>
               <span className="chip !py-0.5 !px-2">{u.status}</span>
+              {u.id !== user.id && (
+                <button
+                  onClick={() => changeUser(u.id, { status: u.status === 'ACTIVE' ? 'SUSPENDED' : 'ACTIVE' })}
+                  disabled={adminUser.isPending}
+                  className="chip !py-1 !px-2 text-xs"
+                >
+                  {u.status === 'ACTIVE' ? 'Suspend' : 'Activate'}
+                </button>
+              )}
             </div>
           ))}
+        </div>
+      </section>
+
+      <section className="card p-5 space-y-3">
+        <h2 className="font-semibold">Record a payout</h2>
+        <p className="text-xs opacity-60">
+          Payout execution is manual: record the bank transfer here after paying a salon for a period.
+        </p>
+        <div className="grid sm:grid-cols-2 xl:grid-cols-5 gap-2">
+          <select
+            value={payoutForm.salonId}
+            onChange={(e) => setPayoutForm({ ...payoutForm, salonId: e.target.value })}
+            className="border border-line rounded-xl px-2 py-2 bg-transparent text-sm"
+          >
+            <option value="">Choose salon</option>
+            {(salons.data?.salons ?? []).map((s: any) => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
+          <input
+            type="date"
+            value={payoutForm.period_start}
+            onChange={(e) => setPayoutForm({ ...payoutForm, period_start: e.target.value })}
+            className="border border-line rounded-xl px-2 py-2 bg-transparent text-sm"
+          />
+          <input
+            type="date"
+            value={payoutForm.period_end}
+            onChange={(e) => setPayoutForm({ ...payoutForm, period_end: e.target.value })}
+            className="border border-line rounded-xl px-2 py-2 bg-transparent text-sm"
+          />
+          <input
+            placeholder="Amount (₹)"
+            inputMode="decimal"
+            value={payoutForm.amount}
+            onChange={(e) => setPayoutForm({ ...payoutForm, amount: e.target.value })}
+            className="border border-line rounded-xl px-2 py-2 bg-transparent text-sm"
+          />
+          <input
+            placeholder="UTR / reference"
+            value={payoutForm.reference}
+            onChange={(e) => setPayoutForm({ ...payoutForm, reference: e.target.value })}
+            className="border border-line rounded-xl px-2 py-2 bg-transparent text-sm"
+          />
+        </div>
+        <button onClick={savePayout} disabled={payout.isPending} className="btn-primary !py-2 !px-4 text-sm">
+          {payout.isPending ? 'Recording…' : 'Record payout'}
+        </button>
+      </section>
+
+      <section className="card p-5">
+        <h2 className="font-semibold">Admin audit log</h2>
+        <div className="mt-3 space-y-1">
+          {(audit.data?.events ?? []).slice(0, 20).map((event) => (
+            <div key={event.id} className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-1 text-xs">
+              <span className="opacity-60">
+                {new Date(event.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+              </span>
+              <span>{event.action}</span>
+              <span className="opacity-60">{event.salon_name ?? event.entity_type}</span>
+              <span className="opacity-60">{event.actor_name ?? 'system'}</span>
+            </div>
+          ))}
+          {!audit.data?.events.length && <p className="text-sm opacity-60">No admin actions recorded yet.</p>}
         </div>
       </section>
     </div>

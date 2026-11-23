@@ -72,13 +72,13 @@ Useful scripts:
 | `npm run build`     | TypeScript compile to `dist/` (`dist/src/index.js`)        |
 | `npm start`         | Run the compiled server                                    |
 | `npm run typecheck` | `tsc --noEmit` across src, scripts and tests               |
-| `npm test`          | Unit tests (signatures, storage keys/presign, rendering)   |
+| `npm test`          | Unit tests (signatures, storage presign, validation, rendering) |
 | `npm run migrate`   | Apply pending migrations                                   |
 | `npm run migrate:prod` | Apply migrations from the compiled build                |
 | `npm run seed`      | Load the deterministic demo dataset                        |
 | `npm run db:reset`  | Drop the `public` schema (destructive)                     |
 | `npm run dispatch`  | One-shot reminder dispatch (cron-friendly, no HTTP)        |
-| `npm run smoke`     | 26-check end-to-end test against a running API             |
+| `npm run smoke`     | End-to-end test against a running API (55 checks with Razorpay test keys) |
 
 A clean rebuild:
 
@@ -97,8 +97,16 @@ npm run smoke
 Covers health, notification provider routing, customer/owner/admin OTP login, discovery,
 salon profile, availability, slot hold, booking creation, booking detail, partner dashboard,
 day book, CRM (through RLS), reminders, reminder delivery with a provider receipt, the
-consent guard, live queue, POS invoice, customer booking list, admin stats and two RBAC
-denials.
+consent guard, live queue, POS invoice, customer booking list, admin stats, admin audit log,
+upload limits, presign refusal without storage, KYC format validation, refund rejection,
+partner payouts, session listing, consent history, session revocation, account deletion and
+two RBAC denials. It also signs in the demo manager and staff accounts: the manager reaches
+the dashboard but not owner-only actions, while staff read their own shift, advance an
+assigned booking and are denied the dashboard, CRM, invoices, staff list and unassigned
+bookings. With `RAZORPAY_WEBHOOK_SECRET` set it also posts signed capture/refund
+webhooks and checks the refund ledger (this runs in CI with a dummy secret). With test API
+keys it creates a real test-mode Razorpay order, replays the intent key and verifies a
+checkout signature; those three checks are skipped when keys are absent.
 
 Prove tenant isolation directly:
 
@@ -118,10 +126,15 @@ OTP is auto-filled in dev responses.
 | Role          | Phone           | Name           |
 | ------------- | --------------- | -------------- |
 | Salon owner   | `+919800000001` | Ananya Rao     |
+| Salon manager | `+919800000005` | Aisha Khan     |
+| Staff         | `+919800000006` | Ritika Menon   |
 | Customer      | `+919800000002` | Priya Sharma   |
 | Customer      | `+919800000003` | Neha Verma     |
 | Customer      | `+919800000004` | Kavya Iyer     |
 | Platform admin| `+919800000009` | Platform Admin |
+
+The manager login runs the full partner console; the staff login only gets its own shift and
+assigned bookings (see `GET /partner/me/*`).
 
 Seeded staff are **off on Sundays**; availability lookups should scan a few days ahead.
 
@@ -132,12 +145,13 @@ src/
   index.ts            Fastify bootstrap, CORS/cookies, error mapping, health, shutdown
   env.ts db.ts redis.ts http.ts auth.ts crypto.ts types.ts
   routes/
-    auth.ts           OTP, refresh/logout, profile, consents, addresses
+    auth.ts           OTP, refresh/logout, profile, consents + history, sessions, account deletion
     discovery.ts      categories, search, urgent slots, compare, profile, availability
     bookings.ts       hold, create, list, detail, reschedule, cancel, status, review
     queue.ts          public walk-in join + live queue
-    partner.ts        onboarding, KYC, catalog, staff, day book, billing, CRM, reminders, queue, reviews
-    admin.ts          platform stats, KYC review, commissions, salon/user lists
+    partner.ts        onboarding, KYC, catalog, staff, day book, billing, CRM, reminders, queue, reviews, payouts
+    admin.ts          platform stats, KYC review + document, salon status, user role/status, payouts, audit
+    uploads.ts        presign/confirm/read registry with size and content-type checks
   services/
     availability.ts   slot computation against schedules, breaks, resources, buffers
     booking.ts        holds, creation, reschedule, cancel, status transitions, reviews
@@ -150,14 +164,16 @@ src/
     dispatcher.ts     due-reminder delivery, Redis locks, retries, interval runner
     engagement.ts     click tracking, conversion attribution, delivery events, opt-out, funnel
     transactional.ts  booking/queue/invoice message dispatch through the provider layer
-    payments.ts       payment intents, Razorpay orders/verify/webhook, refunds, settlements
-    storage.ts        S3 SigV4 presigned PUTs without the AWS SDK
+    payments.ts       payment intents, Razorpay orders/verify/webhook, idempotent refunds, settlements, payouts
+    storage.ts        S3 SigV4 presign PUT/GET/HEAD/DELETE without the AWS SDK
+    audit.ts          append-only platform audit log
     signatures.ts     Twilio/Meta/Razorpay signature verification
     rendering.ts      pure reminder + transactional message copy
     opt-out.ts        STOP/unsubscribe detection
+  validation.ts       PAN/GSTIN/IFSC formats shared by routes and tests
   metrics.ts          dependency-free Prometheus counters
   routes/public.ts    /r/:token click redirect and provider callbacks (no /api/v1 prefix)
-db/migrations/        001_extensions … 012_engagement_payments_ops
+db/migrations/        001_extensions … 013_hardening
 test/                 unit tests (node:test via tsx)
 scripts/              migrate, seed, reset, dispatch, smoke
 ```
@@ -165,7 +181,9 @@ scripts/              migrate, seed, reset, dispatch, smoke
 ## 7. Endpoints (prefix `/api/v1`)
 
 **Auth** `POST /auth/otp/request` · `POST /auth/otp/verify` · `POST /auth/refresh` ·
-`POST /auth/logout` · `GET /auth/me` · `PATCH /users/me` · consents · addresses
+`POST /auth/logout` · `GET /auth/me` · `PATCH /users/me` · `DELETE /users/me` ·
+`GET /users/me/sessions` · `POST /users/me/sessions/revoke-all` ·
+`GET /users/me/consents/history` · consents · addresses
 
 **Discovery** `GET /categories` · `GET /discovery/search` · `GET /discovery/urgent` ·
 `GET /discovery/compare` · `GET /salons/:id` · `GET /salons/:id/availability` ·
@@ -180,17 +198,25 @@ scripts/              migrate, seed, reset, dispatch, smoke
 **Partner** `/partner/salons` · `/partner/salon` (+ `/submit`) · `/partner/kyc` · `/partner/hygiene` ·
 `/partner/services` · `/partner/staff` (+ schedule, services) · `/partner/resources` ·
 `/partner/bookings` · `/partner/dashboard` · `/partner/invoices` · `/partner/payments` (+ `/:id/refund`) ·
-`/partner/settlements` · `/partner/ledger/:customerId` · `/partner/crm` ·
+`/partner/settlements` · `/partner/payouts` · `/partner/ledger/:customerId` · `/partner/crm` ·
 `/partner/reminders` (+ `/trigger`, `/dispatch`, `/analytics`) · `/partner/queue` · `/partner/reviews`
+
+**Staff self-service** `GET /partner/me/staff` · `GET /partner/me/bookings?date=` ·
+`PATCH /partner/me/bookings/:id/status` — available to `STAFF` only. The partner console
+routes require `SALON_OWNER`, `SALON_MANAGER` or `PLATFORM_ADMIN`; a staff session is
+rejected with 403 even though it resolves to a salon.
 
 **Payments** `GET /payments/capabilities` · `GET /payments` · `POST /payments/intents` ·
 `POST /payments/:id/verify` (all customer-scoped; intents require `Idempotency-Key`)
 
-**Uploads / devices** `GET /uploads/status` · `POST /uploads/presign` · `PATCH /users/me/avatar` ·
+**Uploads / devices** `GET /uploads/status` · `POST /uploads/presign` · `POST /uploads/confirm` ·
+`GET /uploads/:id/url` · `PATCH /users/me/avatar` ·
 `POST /users/me/devices` · `DELETE /users/me/devices/:token`
 
 **Admin** `GET /admin/stats` · `GET /admin/kyc` · `POST /admin/kyc/:salonId/review` ·
-`PATCH /admin/salons/:id/commission` · `GET /admin/salons` · `GET /admin/users`
+`GET /admin/kyc/:salonId/document` · `PATCH /admin/salons/:id/status` ·
+`PATCH /admin/salons/:id/commission` · `POST /admin/salons/:id/payouts` ·
+`PATCH /admin/users/:id` · `GET /admin/audit` · `GET /admin/salons` · `GET /admin/users`
 
 **Public (no `/api/v1`, signature-verified)** `GET /r/:token` · `POST /webhooks/twilio/status` ·
 `POST /webhooks/twilio/inbound` · `GET|POST /webhooks/whatsapp` · `POST /webhooks/razorpay` ·
@@ -263,15 +289,61 @@ customer service window. Signature checks use `WHATSAPP_APP_SECRET`; webhook ver
 - `razorpay` creates real orders via the live API, verifies checkout signatures, and handles
   `payment.captured`, `payment.failed` and `refund.processed` webhooks. Refunds call
   `/payments/:id/refund` upstream.
+- Payment tables use `FORCE ROW LEVEL SECURITY`, so every webhook lookup runs under the
+  trusted-integration GUC and every write under the owning salon's tenant transaction.
+  `payment.captured` marks the order paid; `refund.processed`/`refund.failed` update the
+  matching ledger row (by our `refund_id` note, then provider id, otherwise inserted as an
+  external refund) and recompute `REFUNDED` vs `PARTIALLY_REFUNDED` from the cumulative
+  ledger. The same fix covers idempotent intent lookup and checkout verification, which
+  previously returned “not found” under RLS.
+- Refunds go through the `payment_refunds` ledger. The partner route accepts an
+  `Idempotency-Key`, reserves the amount inside a transaction, calls the gateway, then marks
+  the ledger row and the order together. A retry with the same key returns the original
+  outcome instead of moving money twice; partial refunds are accumulated, and every refund is
+  written to the audit log.
 - Partner settlement figures are computed from captured invoices in Asia/Kolkata days.
-  Payout execution depends on the provider; the API reports commission and partner net.
+  Payout execution is **manual**: a platform admin records the bank transfer
+  (`POST /admin/salons/:id/payouts`), and `GET /partner/payouts` shows what was paid for a
+  period. The settlement report itself stays computed.
 
 ### Uploads
 
-`POST /uploads/presign` returns a 15-minute SigV4 `PUT` URL. Allowed types are JPEG, PNG, WebP
-and PDF. KYC uploads require the salon owner (or a platform admin) and a `salon_id`. The API
-never proxies file bytes. Without `S3_BUCKET`/keys the endpoint returns
+The upload flow is two-step and registry-backed:
+
+1. `POST /uploads/presign` with `{ purpose, content_type, size_bytes, salon_id? }`. The API
+   stores a `PRESIGNED` row in `uploads`, signs the content type into a 15-minute SigV4 `PUT`
+   URL, and returns the `upload_id` plus the exact header to send.
+2. The client `PUT`s the bytes directly to object storage.
+3. `POST /uploads/confirm` HEADs the object, compares the stored content type and size with the
+   declaration, and only then marks the row `UPLOADED`. A mismatch or oversize object is marked
+   `REJECTED`, deleted, and the request fails.
+
+Allowed types are JPEG, PNG, WebP (5 MB) and PDF (10 MB). KYC uploads require the salon owner
+(or a platform admin) and a `salon_id`. Avatar and KYC keys are only accepted if they point at
+a confirmed upload owned by the caller; admin KYC reads use an audited signed `GET` and never
+expose the key. The API never proxies file bytes. Without `S3_BUCKET`/keys the endpoints return
 `503 STORAGE_NOT_CONFIGURED` and the web UI says storage is not configured.
+
+The presigned `PUT` cannot itself enforce a size limit (there is no POST policy), so the
+server-side ceiling is applied at confirm time via HEAD. The signed `Content-Type` does prevent
+type swapping at upload time.
+
+### Platform governance and account controls
+
+- KYC submissions validate PAN (`ABCDE1234F`), optional GSTIN (15 characters with the `Z`
+  marker) and IFSC (`HDFC0001234`) before anything is stored. Re-submitting after a rejection
+  moves the salon `REJECTED → SUBMITTED`; an already-approved salon keeps `APPROVED` while the
+  KYC row returns to `SUBMITTED` for review of the bank-detail change.
+- Platform admins can pause or activate a salon, change a user's role or status, record
+  payouts, and read the audit log. Role changes apply on the next sign-in; suspending or
+  deleting an account revokes every refresh token immediately, and the last active platform
+  admin cannot be demoted.
+- Customers can list their active sessions, revoke all of them, read the append-only consent
+  history, and delete their account. Deletion is a soft delete: `status='DELETED'`,
+  `deleted_at` set, direct identifiers cleared, addresses and push tokens removed, consents
+  revoked and sessions killed. It is blocked while the customer has an active booking.
+- Multi-salon resolution now includes active `staff_members.user_id` rows after owned salons,
+  so manager/staff logins resolve to a salon and can use partner routes.
 
 ### Health, metrics and backups
 

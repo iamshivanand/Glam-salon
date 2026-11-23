@@ -5,8 +5,9 @@ import { env } from '../src/env.js';
 import {
   StorageNotConfigured,
   buildObjectKey,
-  presignPut,
+  maxBytesFor,
   presignGet,
+  presignPut,
   publicUrlFor,
   storageConfigured,
 } from '../src/services/storage.js';
@@ -101,6 +102,25 @@ test('presignPut honours a public base URL for reads', () => {
   );
 });
 
+test('presignPut signs the declared content type so it cannot be swapped', () => {
+  withS3(
+    {
+      S3_BUCKET: 'glam-test',
+      S3_ACCESS_KEY_ID: 'AKIATEST',
+      S3_SECRET_ACCESS_KEY: 'secret',
+      S3_ENDPOINT: 'http://127.0.0.1:9000',
+      S3_FORCE_PATH_STYLE: 'true',
+      S3_PUBLIC_BASE_URL: undefined,
+      S3_REGION: 'ap-south-1',
+    },
+    () => {
+      const result = presignPut({ key: 'kyc/s1/u1/a.pdf', contentType: 'application/pdf' });
+      assert.match(result.upload_url, /X-Amz-SignedHeaders=content-type%3Bhost/);
+      assert.deepEqual(result.headers, { 'Content-Type': 'application/pdf' });
+    },
+  );
+});
+
 test('presignGet generates 60s SigV4 GET URL for private reference photos', () => {
   withS3(
     {
@@ -129,4 +149,31 @@ test('presignGet falls back gracefully when storage is unconfigured', () => {
     const result = presignGet({ key: 'style-vault/u1/cut.jpg' });
     assert.equal(result.url, '/uploads/mock/style-vault/u1/cut.jpg');
   });
+});
+
+test('maxBytesFor enforces per-type limits', () => {
+  assert.equal(maxBytesFor('image/png'), 5 * 1024 * 1024);
+  assert.equal(maxBytesFor('application/pdf'), 10 * 1024 * 1024);
+  assert.equal(maxBytesFor('text/html'), null);
+});
+
+test('presignGet signs a short-lived read URL', () => {
+  withS3(
+    {
+      S3_BUCKET: 'glam-test',
+      S3_ACCESS_KEY_ID: 'AKIATEST',
+      S3_SECRET_ACCESS_KEY: 'secret',
+      S3_ENDPOINT: 'http://127.0.0.1:9000',
+      S3_FORCE_PATH_STYLE: 'true',
+      S3_PUBLIC_BASE_URL: undefined,
+      S3_REGION: 'ap-south-1',
+    },
+    () => {
+      const result = presignGet('kyc/s1/u1/a.pdf', 120);
+      assert.equal(result.expires_in, 120);
+      assert.match(result.url, /X-Amz-SignedHeaders=host/);
+      assert.match(result.url, /X-Amz-Expires=120/);
+      assert.match(result.url, /X-Amz-Signature=[0-9a-f]{64}$/);
+    },
+  );
 });

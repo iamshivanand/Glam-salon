@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import cookie from '@fastify/cookie';
+import { timingSafeEqual } from 'node:crypto';
 import { env, isDev } from './env.js';
 import { AppError } from './http.js';
 import { closeDb, one } from './db.js';
@@ -21,6 +22,14 @@ import { paymentCapabilities } from './services/payments.js';
 import { storageProviderName } from './services/storage.js';
 import { incrementMetric, renderMetrics } from './metrics.js';
 
+/** Constant-time string compare for tokens of arbitrary length. */
+function secureEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
 export async function buildApp() {
   const app = Fastify({
     logger: isDev
@@ -37,6 +46,9 @@ export async function buildApp() {
   });
 
   const origins = env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean);
+  if (origins.includes('*') && !isDev) {
+    throw new Error('CORS_ORIGIN must list explicit origins in production; "*" with credentials would trust every site');
+  }
   await app.register(cors, {
     origin: origins.includes('*') ? true : origins,
     credentials: true,
@@ -44,6 +56,25 @@ export async function buildApp() {
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
   });
   await app.register(cookie);
+
+  // One JSON parser for the whole app:
+  //  - keep the raw body so provider webhooks can verify HMACs byte-for-byte,
+  //  - treat an empty body as `{}` because DELETE requests often send
+  //    `Content-Type: application/json` without payload.
+  app.addContentTypeParser(
+    ['application/json', 'application/*+json'],
+    { parseAs: 'string' },
+    (req, body, done) => {
+      (req as any).rawBody = body;
+      const raw = typeof body === 'string' ? body.trim() : '';
+      if (!raw) return done(null, {});
+      try {
+        done(null, JSON.parse(raw));
+      } catch (err) {
+        done(err as Error, undefined);
+      }
+    },
+  );
 
   app.setErrorHandler((err: any, req, reply) => {
     if (err instanceof AppError) {
@@ -69,6 +100,12 @@ export async function buildApp() {
     if (err?.code === '23503') {
       return reply.status(400).send({
         error: { code: 'INVALID_REFERENCE', message: 'A referenced record does not exist.' },
+      });
+    }
+    // Fastify's own parser/validation errors are client errors, not 500s.
+    if (typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 500) {
+      return reply.status(err.statusCode).send({
+        error: { code: err.code ?? 'BAD_REQUEST', message: err.message },
       });
     }
     req.log.error({ err }, 'unhandled error');
@@ -111,7 +148,16 @@ export async function buildApp() {
   });
 
   if ((env.METRICS_ENABLED ?? 'true') !== 'false') {
-    app.get('/metrics', async (_req, reply) => {
+    app.get('/metrics', async (req, reply) => {
+      if (env.METRICS_TOKEN) {
+        const header = req.headers.authorization;
+        const supplied = header?.startsWith('Bearer ') ? header.slice(7) : (req.query as any)?.token;
+        if (!secureEqual(String(supplied ?? ''), env.METRICS_TOKEN)) {
+          return reply.status(401).send({ error: { code: 'UNAUTHORIZED', message: 'Metrics token required' } });
+        }
+      } else if (!isDev) {
+        return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Route GET /metrics not found' } });
+      }
       reply.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
       return reply.send(renderMetrics());
     });
@@ -127,6 +173,14 @@ export async function buildApp() {
   await app.register(paymentRoutes, { prefix: '/api/v1' });
   await app.register(uploadRoutes, { prefix: '/api/v1' });
   await app.register(deviceRoutes, { prefix: '/api/v1' });
+
+  app.addHook('onSend', async (_req, reply) => {
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-Frame-Options', 'DENY');
+    reply.header('Referrer-Policy', 'no-referrer');
+    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (!isDev) reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  });
 
   app.addHook('onResponse', async (req, reply) => {
     incrementMetric(`glamconnect_http_requests_total`);

@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { badRequest } from '../http.js';
+import { AppError, badRequest } from '../http.js';
 import { parse } from '../http.js';
 import { authenticate } from '../auth.js';
+import { rateLimit } from '../redis.js';
 import {
   createPaymentIntent,
   listPaymentsForCustomer,
@@ -30,6 +31,16 @@ function idempotencyKey(req: any): string {
   return key;
 }
 
+async function limitPaymentCalls(
+  key: string,
+  max: number,
+  windowSec: number,
+  message: string,
+): Promise<void> {
+  const result = await rateLimit(key, max, windowSec);
+  if (!result.allowed) throw new AppError(429, 'RATE_LIMITED', message);
+}
+
 export const paymentRoutes: FastifyPluginAsync = async (app) => {
   app.get('/payments/capabilities', async () => paymentCapabilities());
 
@@ -42,6 +53,18 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     if (!body.booking_id && !body.invoice_id) {
       throw badRequest('VALIDATION_ERROR', 'booking_id or invoice_id is required');
     }
+    await limitPaymentCalls(
+      `payment:intent:user:${req.auth!.id}`,
+      10,
+      60,
+      'Too many payment attempts. Wait a minute and try again.',
+    );
+    await limitPaymentCalls(
+      `payment:intent:ip:${req.ip}`,
+      30,
+      60,
+      'Too many payment attempts from this network. Try again shortly.',
+    );
     return createPaymentIntent({
       customerId: req.auth!.id,
       bookingId: body.booking_id,
@@ -54,6 +77,12 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   app.post('/payments/:id/verify', { preHandler: [authenticate] }, async (req) => {
     const { id } = req.params as { id: string };
     const body = parse(VerifyInput, req.body);
+    await limitPaymentCalls(
+      `payment:verify:${req.auth!.id}`,
+      20,
+      60,
+      'Too many verification attempts. Wait a minute and try again.',
+    );
     return verifyPayment({
       paymentId: id,
       customerId: req.auth!.id,

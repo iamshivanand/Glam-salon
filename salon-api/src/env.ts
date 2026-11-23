@@ -75,6 +75,7 @@ const EnvSchema = z.object({
 
   // Operational endpoints.
   METRICS_ENABLED: z.string().optional(),
+  METRICS_TOKEN: z.string().min(16).optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

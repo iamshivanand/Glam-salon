@@ -298,6 +298,40 @@ export interface PartnerBooking {
   items: { id: string; service_name: string; staff_name: string | null; price_paise?: number }[];
 }
 
+export interface StaffMe {
+  staff: { id: string; salon_id: string; display_name: string; specialization: string | null };
+  salon: { id: string; name: string; slug: string; address_line: string; locality: string; city: string };
+  schedule: {
+    day_of_week: number;
+    override_date: string | null;
+    shift_start: string;
+    shift_end: string;
+    breaks_json: { start: string; end: string }[];
+    is_working_day: boolean;
+  }[];
+  today: string;
+}
+
+export interface StaffBooking {
+  id: string;
+  booking_code: string;
+  status: string;
+  scheduled_start_at: string;
+  scheduled_end_at: string;
+  total_payable_paise: number;
+  checkin_pin?: string;
+  customer_name: string;
+  customer_notes?: string | null;
+  items: {
+    id: string;
+    service_name: string;
+    start_at: string;
+    end_at: string;
+    price_paise: number;
+    status: string;
+  }[];
+}
+
 export interface QueueToken {
   token_number: number;
   customer_name: string;
@@ -380,6 +414,14 @@ export const partnerDashboard = (period: 'TODAY' | 'WEEK' | 'MONTH' = 'MONTH') =
 
 export const partnerBookings = (date: string) =>
   api<{ date: string; bookings: PartnerBooking[] }>(`/partner/bookings?date=${date}`);
+
+export const staffMe = () => api<StaffMe>('/partner/me/staff');
+
+export const staffBookings = (date: string) =>
+  api<{ date: string; bookings: StaffBooking[] }>(`/partner/me/bookings?date=${date}`);
+
+export const updateStaffBookingStatus = (id: string, status: string) =>
+  api(`/partner/me/bookings/${id}/status`, { method: 'PATCH', body: { status } });
 
 export const partnerQueue = () =>
   api<{ now_serving_token: number | null; waiting_count: number; queue: QueueToken[]; walkin_paused: boolean }>(

@@ -7,13 +7,18 @@ import {
   uploadFile,
   useAddAddress,
   useAddresses,
+  useConsentHistory,
   useConsents,
   useCustomerLoyaltyLedger,
   useCustomerStyleVault,
-  useDeleteAddress,
   useDeleteAccount,
+  useDeleteAddress,
+  useExportMyData,
   useMe,
   usePayments,
+  useRevokeAllSessions,
+  useRevokeSession,
+  useSessions,
   useSetAvatar,
   useSetConsent,
   useUpdateAddress,
@@ -31,11 +36,12 @@ const PURPOSES = [
 const GENDER_OPTIONS = ['Male', 'Female', 'Non-binary', 'Other', 'Prefer not to say'] as const;
 
 export default function AccountPage() {
-  const { user, hydrated } = useAuth();
+  const { user, hydrated, logout } = useAuth();
   const { openModal } = useAuthModal();
   const me = useMe(!!user);
   const updateMe = useUpdateMe();
   const consents = useConsents(!!user);
+  const consentHistory = useConsentHistory(!!user);
   const setConsent = useSetConsent();
   const addresses = useAddresses(!!user);
   const addAddress = useAddAddress();
@@ -47,6 +53,10 @@ export default function AccountPage() {
   const payments = usePayments(!!user);
   const styleVault = useCustomerStyleVault(!!user);
   const loyalty = useCustomerLoyaltyLedger(!!user);
+  const sessions = useSessions(!!user);
+  const revokeAllSessions = useRevokeAllSessions();
+  const revokeSession = useRevokeSession();
+  const exportData = useExportMyData();
 
   const [form, setForm] = useState({ full_name: '', email: '', gender: '', date_of_birth: '' });
   const [address, setAddress] = useState({
@@ -61,6 +71,7 @@ export default function AccountPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [editingAddrId, setEditingAddrId] = useState<string | null>(null);
+  const [showDelete, setShowDelete] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState('');
   const [genderOpen, setGenderOpen] = useState(false);
   const genderDropdownRef = useRef<HTMLDivElement>(null);
@@ -170,6 +181,63 @@ export default function AccountPage() {
     const rows = consents.data?.consents ?? [];
     const specific = rows.find((c) => c.purpose === purpose && c.channel === channel && c.salon_id === null);
     return specific?.is_granted ?? purpose === 'RETENTION_REMINDER';
+  };
+
+  const signOutEverywhere = async () => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      const result = await revokeAllSessions.mutateAsync();
+      await logout();
+      setNotice(`Signed out of ${result.revoked} session${result.revoked === 1 ? '' : 's'}.`);
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const signOutDevice = async (id: string) => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      await revokeSession.mutateAsync(id);
+      setNotice('That device has been signed out.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const downloadData = async () => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      const data = await exportData.mutateAsync();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `glam-connect-data-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice('Your data export has been downloaded.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const removeAccount = async () => {    setNotice(null);
+    setProblem(null);
+    if (deleteConfirm !== 'DELETE') {
+      setProblem('Type DELETE to confirm account deletion.');
+      return;
+    }
+    try {
+      await deleteAccount.mutateAsync();
+      await logout();
+    } catch (err: any) {
+      setProblem(err.message);
+    }
   };
 
   return (
@@ -337,6 +405,58 @@ export default function AccountPage() {
         <p className="text-[11px] opacity-50">
           Replying STOP to a WhatsApp or SMS reminder opts you out across salons immediately.
         </p>
+
+        <details className="pt-2">
+          <summary className="text-xs cursor-pointer opacity-70">Consent history</summary>
+          <ul className="mt-2 space-y-1 text-xs">
+            {(consentHistory.data?.events ?? []).slice(0, 12).map((event) => (
+              <li key={event.id} className="flex flex-wrap items-center gap-2 border-t border-line pt-1">
+                <span className="opacity-60">
+                  {new Date(event.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+                </span>
+                <span>{event.purpose}</span>
+                <span className="opacity-60">{event.channel}</span>
+                <span className={event.is_granted ? 'text-green-700' : 'text-red-700'}>
+                  {event.is_granted ? 'granted' : 'revoked'}
+                </span>
+              </li>
+            ))}
+            {!consentHistory.data?.events.length && <li className="opacity-60">No consent changes recorded yet.</li>}
+          </ul>
+        </details>
+      </section>
+
+      <section className="card p-6 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="font-semibold">Sessions &amp; devices</h2>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={downloadData} disabled={exportData.isPending} className="chip !py-1 !px-3 text-xs">
+              {exportData.isPending ? 'Preparing…' : 'Download my data'}
+            </button>
+            <button onClick={signOutEverywhere} disabled={revokeAllSessions.isPending} className="chip !py-1 !px-3 text-xs">
+              {revokeAllSessions.isPending ? 'Signing out…' : 'Sign out everywhere'}
+            </button>
+          </div>
+        </div>
+        <div className="space-y-2">
+          {(sessions.data?.sessions ?? []).map((session) => (
+            <div key={session.id} className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2 text-sm">
+              <span>{session.device_fingerprint ? session.device_fingerprint.slice(0, 48) : 'Unknown device'}</span>
+              <span className="text-xs opacity-60">{session.ip_address ?? 'no IP'}</span>
+              <span className="text-xs opacity-60">
+                started {new Date(session.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
+              </span>
+              <button
+                onClick={() => signOutDevice(session.id)}
+                disabled={revokeSession.isPending}
+                className="text-xs underline opacity-60"
+              >
+                Sign out
+              </button>
+            </div>
+          ))}
+          {!sessions.data?.sessions.length && <p className="text-sm opacity-60">No active sessions.</p>}
+        </div>
       </section>
 
       <section className="card p-6 space-y-3">
@@ -638,24 +758,35 @@ export default function AccountPage() {
       </section>
 
       <section className="card p-6 space-y-3 border-red-200">
-        <h2 className="font-semibold text-red-600">Delete account</h2>
-        <p className="text-sm opacity-70">
-          This will permanently erase your profile, addresses, preferences and consent records. Completed booking history
-          is retained in anonymised form for salon records. This action cannot be undone.
+        <h2 className="font-semibold text-red-700">Delete account</h2>
+        <p className="text-xs opacity-60">
+          This removes your profile details, addresses, push tokens and sessions. Past bookings and invoices are
+          retained without your name for accounting and dispute handling. Upcoming bookings must be cancelled first.
         </p>
-        <input
-          value={deleteConfirm}
-          onChange={(e) => setDeleteConfirm(e.target.value)}
-          placeholder='Type "DELETE" to confirm'
-          className="w-full border border-red-200 rounded-xl px-3 py-2 bg-transparent text-sm"
-        />
-        <button
-          onClick={handleDeleteAccount}
-          disabled={deleteConfirm !== 'DELETE' || deleteAccount.isPending}
-          className="bg-red-600 text-white rounded-xl px-4 py-2 text-sm disabled:opacity-40"
-        >
-          {deleteAccount.isPending ? 'Deleting…' : 'Permanently delete my account'}
-        </button>
+        {!showDelete ? (
+          <button onClick={() => setShowDelete(true)} className="chip !py-2 text-xs text-red-700">
+            Delete my account
+          </button>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={deleteConfirm}
+              onChange={(e) => setDeleteConfirm(e.target.value.toUpperCase())}
+              placeholder="Type DELETE"
+              className="border border-line rounded-xl px-3 py-2 bg-transparent text-sm"
+            />
+            <button
+              onClick={removeAccount}
+              disabled={deleteAccount.isPending || deleteConfirm !== 'DELETE'}
+              className="chip !py-2 text-xs text-red-700 border-red-300 disabled:opacity-40"
+            >
+              {deleteAccount.isPending ? 'Deleting…' : 'Permanently delete'}
+            </button>
+            <button onClick={() => { setShowDelete(false); setDeleteConfirm(''); }} className="text-xs underline opacity-60">
+              Cancel
+            </button>
+          </div>
+        )}
       </section>
     </div>
   );

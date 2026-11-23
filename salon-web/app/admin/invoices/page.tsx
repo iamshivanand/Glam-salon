@@ -67,7 +67,8 @@ export default function AdminInvoices() {
       </div>
 
       <p className="text-xs opacity-50">
-        Payments are recorded at the salon. Online gateway capture and refunds are not connected yet.
+        Payments are recorded at the salon. Gateway capture and refunds are available from Settlements when Razorpay
+        credentials are configured; manual rows only record intent.
       </p>
     </div>
   );
