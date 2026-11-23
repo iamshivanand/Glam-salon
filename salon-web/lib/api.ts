@@ -1433,3 +1433,50 @@ export function useUpdateCommission() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin'] }),
   });
 }
+
+// ------------------------------------------------------------------ admin disputes (API-38)
+export interface AdminDispute {
+  id: string;
+  booking_id: string;
+  booking_code: string;
+  salon_id: string;
+  salon_name: string;
+  salon_locality: string;
+  salon_city: string;
+  customer_id: string;
+  customer_name: string;
+  staff_id: string | null;
+  staff_name: string | null;
+  overall_rating: number;
+  hygiene_rating: number;
+  review_text: string | null;
+  ai_complaint_tags: string[];
+  owner_reply: string | null;
+  resolution_status: 'OPEN_ALERT' | 'ESCALATED' | 'RESOLVED' | 'NONE';
+  created_at: string;
+}
+
+export function useAdminDisputes(status?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'disputes', status ?? 'active'],
+    queryFn: () =>
+      api<{ disputes: AdminDispute[] }>(`/admin/disputes${status ? `?status=${status}` : ''}`),
+    enabled,
+  });
+}
+
+export function useUpdateDispute() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      resolution_status,
+      owner_reply,
+    }: {
+      id: string;
+      resolution_status: string;
+      owner_reply?: string;
+    }) => api(`/admin/disputes/${id}`, { method: 'PATCH', body: { resolution_status, owner_reply } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin', 'disputes'] }),
+  });
+}

@@ -847,11 +847,13 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // ---------- Dashboard ----------
-  app.get('/partner/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const getDashboardHandler = async (req: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
     const q = parse(z.object({ period: z.enum(['TODAY', 'WEEK', 'MONTH']).optional() }), req.query);
     return dashboard(salonId, q.period ?? 'TODAY');
-  });
+  };
+  app.get('/partner/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getDashboardHandler);
+  app.get('/partner/salons/:id/analytics/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getDashboardHandler); // API-35
 
   // ---------- Billing ----------
   const createInvoiceHandler = async (req: any, reply: any) => {

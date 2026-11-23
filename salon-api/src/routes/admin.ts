@@ -160,4 +160,58 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     );
     return { users: rows };
   });
+
+  // API-38: Platform admin disputes listing & escalation management
+  app.get('/admin/disputes', async (req) => {
+    const q = parse(
+      z.object({
+        status: z.enum(['OPEN_ALERT', 'ESCALATED', 'RESOLVED', 'ALL']).optional(),
+      }),
+      req.query,
+    );
+    const filterStatus = q.status ?? null;
+    const rows = await query(
+      `SELECT r.id, r.booking_id, b.booking_code,
+              r.salon_id, s.name AS salon_name, s.locality AS salon_locality, s.city AS salon_city,
+              r.customer_id, u.full_name AS customer_name,
+              r.staff_id, sm.display_name AS staff_name,
+              r.overall_rating, r.hygiene_rating, r.review_text,
+              COALESCE(r.ai_complaint_tags, '{}') AS ai_complaint_tags,
+              r.owner_reply, r.resolution_status,
+              r.created_at
+         FROM reviews r
+         JOIN salons s ON s.id = r.salon_id
+         JOIN bookings b ON b.id = r.booking_id
+         JOIN users u ON u.id = r.customer_id
+         LEFT JOIN staff_members sm ON sm.id = r.staff_id
+        WHERE ($1::text IS NULL AND r.resolution_status IN ('OPEN_ALERT', 'ESCALATED'))
+           OR ($1::text = 'ALL')
+           OR ($1::text IS NOT NULL AND r.resolution_status::text = $1)
+        ORDER BY r.created_at DESC
+        LIMIT 100`,
+      [filterStatus],
+    );
+    return { disputes: rows };
+  });
+
+  app.patch('/admin/disputes/:id', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parse(
+      z.object({
+        resolution_status: z.enum(['OPEN_ALERT', 'ESCALATED', 'RESOLVED']),
+        owner_reply: z.string().max(1000).optional(),
+      }),
+      req.body,
+    );
+    const updated = await one(
+      `UPDATE reviews
+          SET resolution_status = $2,
+              owner_reply = COALESCE($3, owner_reply)
+        WHERE id = $1
+        RETURNING *`,
+      [id, body.resolution_status, body.owner_reply ?? null],
+    );
+    if (!updated) throw notFound('Review not found');
+    return updated;
+  });
 };

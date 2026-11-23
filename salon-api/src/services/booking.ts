@@ -621,6 +621,62 @@ export async function updateBookingStatus(opts: {
   return updated;
 }
 
+export function extractComplaintTags(
+  reviewText?: string | null,
+  ratings?: { overall?: number; hygiene?: number },
+): string[] {
+  const tags = new Set<string>();
+  const text = (reviewText ?? '').toLowerCase();
+
+  // 1. Cleanliness & Hygiene (negative keywords or low hygiene rating <= 2)
+  if (
+    (ratings?.hygiene !== undefined && ratings.hygiene <= 2) ||
+    /\b(dirty|unhygienic|smell(y|ed)?|stink(ing)?|filthy|stains?|dusty|gross|unclean|hair on chair|insects?)\b/i.test(text) ||
+    /\b(bad|poor|terrible|lack of)\s+(hygiene|cleanliness)\b/i.test(text) ||
+    /\bnot\s+clean\b/i.test(text)
+  ) {
+    tags.add('CLEANLINESS');
+  }
+
+  // 2. Wait time & Queue delay (skip if negated: e.g. "no wait", "zero waiting")
+  const hasNegatedWait = /\b(no|zero|without|never|didn't|did not)\s+(wait|waiting|delay|delays)\b/i.test(text);
+  if (
+    !hasNegatedWait &&
+    (/\b(waited|too slow|delayed?|running late|huge queue|queue delay|took too long|took forever)\b/i.test(text) ||
+      /\b(long|excessive)\s+wait(ing)?\b/i.test(text) ||
+      /\bwait(ed|ing)?\s+(\d+|too|past)\b/i.test(text))
+  ) {
+    tags.add('WAIT_TIME');
+  }
+
+  // 3. Pricing & Billing issues
+  if (
+    /\b(expensive|overpriced|overcharged?|charged extra|cheat(ed)?|hidden fees?|rip off|ripoff|loot)\b/i.test(text) ||
+    /\b(high|unfair)\s+pric(e|ing)\b/i.test(text)
+  ) {
+    tags.add('PRICING');
+  }
+
+  // 4. Staff behaviour & Attitude
+  if (
+    /\b(rude|arrogant|attitude|unprofessional|disrespectful|misbehaved|harsh|screamed|shouted|careless)\b/i.test(text) ||
+    /\bbad\s+behavio(u)?r\b/i.test(text)
+  ) {
+    tags.add('STAFF_BEHAVIOUR');
+  }
+
+  // 5. Service quality & Skill issues (keyword matches or low overall rating <= 2)
+  if (
+    (ratings?.overall !== undefined && ratings.overall <= 2) ||
+    /\b(bad cut|ruined|uneven|worst|terrible|awful|horrible|pain|hurt|bleeding|burn|damaged|amateur)\b/i.test(text) ||
+    /\bpoor\s+service\b/i.test(text)
+  ) {
+    tags.add('SERVICE_QUALITY');
+  }
+
+  return Array.from(tags);
+}
+
 export async function createReview(opts: {
   bookingId: string;
   customerId: string;
@@ -641,12 +697,16 @@ export async function createReview(opts: {
     [opts.bookingId],
   );
   const alert = opts.overallRating <= 2;
+  const tags = extractComplaintTags(opts.reviewText, {
+    overall: opts.overallRating,
+    hygiene: opts.hygieneRating,
+  });
 
   const review = await one(
     `INSERT INTO reviews
        (booking_id, salon_id, customer_id, staff_id, overall_rating, hygiene_rating,
-        review_text, resolution_status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        review_text, ai_complaint_tags, resolution_status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
      RETURNING *`,
     [
       opts.bookingId,
@@ -656,6 +716,7 @@ export async function createReview(opts: {
       opts.overallRating,
       opts.hygieneRating,
       opts.reviewText ?? null,
+      tags,
       alert ? 'OPEN_ALERT' : 'NONE',
     ],
   );
