@@ -14,6 +14,26 @@ export interface ReminderScheduleInput {
 }
 
 /**
+ * Calculates adaptive next-visit interval using Exponentially Weighted Moving Average (EWMA):
+ * Interval_new = round(0.7 * ActualDaysSinceLastVisit + 0.3 * Interval_old)
+ * Clamped to [7, 90] days per Phase 1 Engineering Blueprint Section 3.
+ */
+export function calculateAdaptiveInterval(opts: {
+  actualDaysSinceLastVisit?: number | null;
+  previousIntervalDays?: number | null;
+  baseServiceIntervalDays?: number | null;
+  isRepeatVisit: boolean;
+}): number {
+  const baseInterval = opts.baseServiceIntervalDays ?? 25;
+  if (!opts.isRepeatVisit || opts.actualDaysSinceLastVisit == null || opts.actualDaysSinceLastVisit <= 0) {
+    return Math.max(7, Math.min(90, Math.round(baseInterval)));
+  }
+  const oldInterval = opts.previousIntervalDays ?? baseInterval;
+  const ewma = Math.round(0.7 * opts.actualDaysSinceLastVisit + 0.3 * oldInterval);
+  return Math.max(7, Math.min(90, ewma));
+}
+
+/**
  * F1.12 closed loop: after a completed visit, schedule Day N-5 / N / N+10 reminders.
  * Runs inside the caller's transaction with app.current_salon_id already set.
  */
@@ -55,12 +75,19 @@ export async function scheduleReminders(client: pg.PoolClient, input: ReminderSc
 }
 
 /** Instant suppression when a new booking is created (F1.12). */
-export async function suppressReminders(client: pg.PoolClient, customerId: string, salonId: string): Promise<void> {
+export async function suppressReminders(
+  client: pg.PoolClient,
+  customerId: string,
+  salonId: string,
+  bookingId?: string,
+): Promise<void> {
   await client.query(
     `UPDATE retention_reminders
-        SET status = 'SUPPRESSED_ALREADY_BOOKED'
+        SET status = 'SUPPRESSED_ALREADY_BOOKED',
+            attributed_booking_id = COALESCE($3, attributed_booking_id),
+            updated_at = NOW()
       WHERE customer_id = $1 AND salon_id = $2 AND status = 'SCHEDULED'`,
-    [customerId, salonId],
+    [customerId, salonId, bookingId ?? null],
   );
 }
 

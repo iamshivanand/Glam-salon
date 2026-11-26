@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { one, query, withTenant } from '../db.js';
-import { parse, badRequest, notFound, forbidden, conflict, AppError } from '../http.js';
+import { AppError, parse, badRequest, notFound, forbidden, conflict } from '../http.js';
 import { authenticate, requireRole, salonIdForUser } from '../auth.js';
 import { rateLimit } from '../redis.js';
 import { encrypt } from '../crypto.js';
@@ -21,6 +21,9 @@ import { recordAudit } from '../services/audit.js';
 import { updateBookingStatus } from '../services/booking.js';
 import { isValidGstin, isValidIfsc, isValidPan, normalizeCode } from '../validation.js';
 import { fmtLocalDate } from '../services/availability.js';
+import { invalidateSalonProfileCache } from '../services/discovery.js';
+import { redis } from '../redis.js';
+import { presignGet, presignPut, publicUrlFor, buildObjectKey, storageConfigured } from '../services/storage.js';
 
 // STAFF deliberately sits outside the partner console: they get a narrow
 // self-service surface (their own shift and assigned bookings) instead of
@@ -30,8 +33,8 @@ const OWNER_ROLES = ['SALON_OWNER', 'PLATFORM_ADMIN'] as const;
 const STAFF_ROLES = ['STAFF'] as const;
 
 async function resolveSalonId(req: any): Promise<string> {
-  const header = req.headers['x-salon-id'];
-  const requested = typeof header === 'string' ? header : undefined;
+  const paramOrHeader = req.params?.id ?? req.headers['x-salon-id'];
+  const requested = typeof paramOrHeader === 'string' && /^[0-9a-f-]{36}$/i.test(paramOrHeader) ? paramOrHeader : undefined;
   if (requested) {
     const owned = await one(
       `SELECT id FROM salons WHERE id = $1 AND (owner_id = $2 OR $3 = 'PLATFORM_ADMIN')`,
@@ -153,6 +156,13 @@ const ServiceInput = z.object({
   quote_questions_schema: z.array(z.any()).optional(),
 });
 
+const StaffBreakInput = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+  start_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'start_time must be HH:MM'),
+  end_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'end_time must be HH:MM'),
+  reason: z.string().max(100).optional(),
+});
+
 const StaffInput = z.object({
   display_name: z.string().min(1).max(100),
   user_id: z.string().uuid().nullish(),
@@ -161,6 +171,18 @@ const StaffInput = z.object({
   is_bgv_verified: z.boolean().optional(),
   home_visit_enabled: z.boolean().optional(),
   commission_share_bps: z.number().int().min(0).max(10000).optional(),
+  service_ids: z.array(z.string().uuid()).optional(),
+  weekly_shifts: z
+    .array(
+      z.object({
+        day_of_week: z.number().int().min(0).max(6),
+        shift_start: z.string().regex(/^\d{2}:\d{2}$/),
+        shift_end: z.string().regex(/^\d{2}:\d{2}$/),
+        breaks: z.array(z.object({ start: z.string(), end: z.string(), reason: z.string().optional() })).optional(),
+        is_working_day: z.boolean().optional(),
+      }),
+    )
+    .optional(),
 });
 
 const ScheduleInput = z.object({
@@ -175,6 +197,16 @@ const ScheduleInput = z.object({
       }),
     )
     .max(7),
+});
+
+const StyleVaultInput = z.object({
+  preferred_staff_id: z.string().uuid().nullish(),
+  preferred_service_ids: z.array(z.string().uuid()).optional(),
+  style_preferences: z.record(z.any()).optional(),
+  style_preferences_json: z.record(z.any()).optional(),
+  request_photo_upload_count: z.number().int().min(0).max(5).optional(),
+  uploaded_photo_keys: z.array(z.string()).optional(),
+  reference_photo_s3_keys: z.array(z.string()).optional(),
 });
 
 export const partnerRoutes: FastifyPluginAsync = async (app) => {
@@ -291,7 +323,9 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     if (!sets.length) throw badRequest('VALIDATION_ERROR', 'No fields to update');
 
     params.push(salonId);
-    return one(`UPDATE salons SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`, params);
+    const updated = await one(`UPDATE salons SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`, params);
+    await invalidateSalonProfileCache(salonId);
+    return updated;
   });
 
   app.post('/partner/salon/submit', { preHandler: [authenticate, requireRole(...OWNER_ROLES)] }, async (req) => {
@@ -385,8 +419,8 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return row;
   });
 
-  app.patch('/partner/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const handleUpdateHygiene = async (req: any) => {
+    const salonId = (req.params as any)?.id ?? (await resolveSalonId(req));
     const body = parse(
       z.object({
         has_private_room: z.boolean().optional(),
@@ -427,7 +461,11 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         body.hygiene_checklist ? JSON.stringify(body.hygiene_checklist) : null,
       ],
     );
-  });
+  };
+
+  app.patch('/partner/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleUpdateHygiene);
+  app.put('/partner/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleUpdateHygiene);
+  app.patch('/partner/salons/:id/hygiene', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleUpdateHygiene);
 
   // ---------- Catalog ----------
   app.get('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
@@ -441,10 +479,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { services };
   });
 
-  app.post('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const handleCreateService = async (req: any) => {
+    const salonId = (req.params as any)?.id ?? (await resolveSalonId(req));
     const body = parse(ServiceInput, req.body);
-    return one(
+    const created = await one(
       `INSERT INTO salon_services
          (salon_id, category_id, custom_name, description, pricing_model, base_price_paise,
           discounted_price_paise, duration_mins, buffer_after_mins, reminder_interval_days,
@@ -467,7 +505,12 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         JSON.stringify(body.quote_questions_schema ?? []),
       ],
     );
-  });
+    await invalidateSalonProfileCache(salonId);
+    return created;
+  };
+
+  app.post('/partner/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleCreateService);
+  app.post('/partner/salons/:id/services', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, handleCreateService); // API-25 contract alias
 
   app.patch('/partner/services/:id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
@@ -504,6 +547,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       params,
     );
     if (!row) throw notFound('Service not found');
+    await invalidateSalonProfileCache(salonId);
     return row;
   });
 
@@ -515,6 +559,7 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       [id, salonId],
     );
     if (!row) throw notFound('Service not found');
+    await invalidateSalonProfileCache(salonId);
     return { ok: true };
   });
 
@@ -556,10 +601,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { staff };
   });
 
-  app.post('/partner/staff', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const createStaffHandler = async (req: any, reply: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
     const body = parse(StaffInput, req.body);
-    return one(
+    const staff = await one(
       `INSERT INTO staff_members
          (salon_id, user_id, display_name, specialization, experience_years, is_bgv_verified,
           home_visit_enabled, commission_share_bps)
@@ -575,7 +620,148 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         body.commission_share_bps ?? 0,
       ],
     );
-  });
+    if (!staff) throw badRequest('CREATION_FAILED', 'Could not create staff member');
+
+    if (body.service_ids?.length) {
+      for (const serviceId of body.service_ids) {
+        await query(
+          `INSERT INTO staff_service_mapping (staff_id, salon_service_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [staff.id, serviceId],
+        );
+      }
+    }
+
+    if (body.weekly_shifts?.length) {
+      for (const shift of body.weekly_shifts) {
+        await query(
+          `INSERT INTO staff_schedules (staff_id, day_of_week, shift_start, shift_end, breaks_json, is_working_day)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            staff.id,
+            shift.day_of_week,
+            shift.shift_start,
+            shift.shift_end,
+            JSON.stringify(shift.breaks ?? []),
+            shift.is_working_day ?? true,
+          ],
+        );
+      }
+    }
+
+    await redis.del(`salon:next_slot:${salonId}`).catch(() => {});
+
+    reply.status(201);
+    return {
+      ...staff,
+      service_ids: body.service_ids ?? [],
+      weekly_shifts: body.weekly_shifts ?? [],
+    };
+  };
+
+  app.post('/partner/staff', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createStaffHandler);
+  app.post('/partner/salons/:id/staff', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createStaffHandler); // API-26
+
+  const addStaffBreakHandler = async (req: any, reply: any) => {
+    const salonId = await resolveSalonId(req);
+    const staffId = req.params.staff_id ?? req.params.id;
+    const body = parse(StaffBreakInput, req.body);
+
+    const staff = await one(
+      `SELECT * FROM staff_members WHERE id = $1 AND salon_id = $2`,
+      [staffId, salonId],
+    );
+    if (!staff) throw notFound('Staff member not found');
+
+    const startAt = new Date(`${body.date}T${body.start_time}:00+05:30`);
+    const endAt = new Date(`${body.date}T${body.end_time}:00+05:30`);
+    if (startAt.getTime() >= endAt.getTime()) {
+      throw badRequest('VALIDATION_ERROR', 'end_time must be after start_time');
+    }
+
+    // Existing confirmed bookings cannot be silently overridden by break scheduling
+    const activeBooking = await one<{ booking_code: string }>(
+      `SELECT b.booking_code
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+        WHERE bi.staff_id = $1
+          AND bi.status IN ('CONFIRMED', 'ARRIVED', 'IN_SERVICE')
+          AND bi.time_range && tstzrange($2, $3, '[)')
+        LIMIT 1`,
+      [staffId, startAt.toISOString(), endAt.toISOString()],
+    );
+
+    if (activeBooking) {
+      throw conflict(
+        'CONFLICT_WITH_BOOKING',
+        `Cannot schedule break: overlapping confirmed booking (${activeBooking.booking_code}) exists for this staff member`,
+      );
+    }
+
+    const newBreak = {
+      start: body.start_time,
+      end: body.end_time,
+      reason: body.reason ?? 'Break',
+    };
+
+    const existingOverride = await one<{ id: string; breaks_json: any }>(
+      `SELECT id, breaks_json FROM staff_schedules WHERE staff_id = $1 AND override_date = $2 LIMIT 1`,
+      [staffId, body.date],
+    );
+
+    if (existingOverride) {
+      const existingBreaks = Array.isArray(existingOverride.breaks_json) ? existingOverride.breaks_json : [];
+      const updatedBreaks = [...existingBreaks, newBreak];
+      await query(
+        `UPDATE staff_schedules SET breaks_json = $1 WHERE id = $2`,
+        [JSON.stringify(updatedBreaks), existingOverride.id],
+      );
+    } else {
+      const dow = new Date(`${body.date}T00:00:00Z`).getUTCDay();
+      const normalShift = await one<{ shift_start: string; shift_end: string; breaks_json: any }>(
+        `SELECT shift_start, shift_end, breaks_json FROM staff_schedules WHERE staff_id = $1 AND override_date IS NULL AND day_of_week = $2 LIMIT 1`,
+        [staffId, dow],
+      );
+      const shiftStart = normalShift?.shift_start ?? '09:00:00';
+      const shiftEnd = normalShift?.shift_end ?? '21:00:00';
+      const breaks = normalShift && Array.isArray(normalShift.breaks_json)
+        ? [...normalShift.breaks_json, newBreak]
+        : [newBreak];
+
+      await query(
+        `INSERT INTO staff_schedules (staff_id, day_of_week, override_date, shift_start, shift_end, breaks_json, is_working_day)
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE)`,
+        [staffId, dow, body.date, shiftStart, shiftEnd, JSON.stringify(breaks)],
+      );
+    }
+
+    // Update Redis 96-bit daily availability bitmap
+    const [sh, sm] = body.start_time.split(':').map(Number);
+    const [eh, em] = body.end_time.split(':').map(Number);
+    const startBit = Math.max(0, Math.min(95, Math.floor((sh * 60 + sm) / 15)));
+    const endBit = Math.max(0, Math.min(96, Math.ceil((eh * 60 + em) / 15)));
+
+    const dateNorm = body.date.replace(/-/g, '');
+    const staffBitmapKey = `avail:bitmap:${salonId}:${staffId}:${dateNorm}`;
+    const pipe = redis.pipeline();
+    for (let bit = startBit; bit < endBit; bit++) {
+      pipe.setbit(staffBitmapKey, bit, 1);
+    }
+    pipe.expire(staffBitmapKey, 86400 * 7);
+    pipe.del(`avail:bitmap:${salonId}:${body.date}`);
+    pipe.del(`salon:next_slot:${salonId}`);
+    await pipe.exec().catch(() => {});
+
+    reply.status(201);
+    return {
+      ok: true,
+      staff_id: staffId,
+      date: body.date,
+      break: newBreak,
+      bits_marked: [startBit, Math.max(startBit, endBit - 1)],
+    };
+  };
+
+  app.post('/partner/staff/:id/breaks', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, addStaffBreakHandler); // API-27
 
   app.patch('/partner/staff/:id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
@@ -768,6 +954,15 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     const date = q.date ?? fmtLocalDate(new Date());
     const bookings = await query(
       `SELECT b.*, u.full_name AS customer_name, u.phone_blind_index,
+              EXISTS (
+                SELECT 1 FROM payment_orders po
+                 WHERE po.booking_id = b.id AND po.status = 'PAID'
+              ) AS is_prepaid,
+              (
+                SELECT po.provider_payment_id FROM payment_orders po
+                 WHERE po.booking_id = b.id AND po.status = 'PAID'
+                 ORDER BY po.created_at DESC LIMIT 1
+              ) AS prepaid_payment_id,
               COALESCE(json_agg(json_build_object(
                 'id', bi.id, 'service_name', bi.service_name_snapshot, 'staff_id', bi.staff_id,
                 'staff_name', sm.display_name, 'start_at', lower(bi.time_range), 'end_at', upper(bi.time_range),
@@ -807,15 +1002,43 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
     return { ...booking, items, customer, audit };
   });
 
+  // API-28 – Update partner booking status
+  app.patch(
+    '/partner/bookings/:id/status',
+    { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] },
+    async (req) => {
+      const salonId = await resolveSalonId(req);
+      const { id } = req.params as { id: string };
+      const body = parse(
+        z.object({
+          status: z.enum(['CONFIRMED', 'DECLINED', 'ARRIVED', 'IN_SERVICE', 'COMPLETED', 'NO_SHOW', 'CANCELLED_BY_SALON']),
+          checkin_pin: z.string().regex(/^\d{4}$/).optional(),
+        }),
+        req.body,
+      );
+      const b = await one(`SELECT id FROM bookings WHERE id = $1 AND salon_id = $2`, [id, salonId]);
+      if (!b) throw notFound('Booking not found for this salon');
+
+      return updateBookingStatus({
+        bookingId: id,
+        auth: req.auth!,
+        status: body.status,
+        checkinPin: body.checkin_pin,
+      });
+    },
+  );
+
   // ---------- Dashboard ----------
-  app.get('/partner/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const getDashboardHandler = async (req: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
     const q = parse(z.object({ period: z.enum(['TODAY', 'WEEK', 'MONTH']).optional() }), req.query);
     return dashboard(salonId, q.period ?? 'TODAY');
-  });
+  };
+  app.get('/partner/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getDashboardHandler);
+  app.get('/partner/salons/:id/analytics/dashboard', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getDashboardHandler); // API-35
 
   // ---------- Billing ----------
-  app.post('/partner/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  const createInvoiceHandler = async (req: any, reply: any) => {
     const salonId = await resolveSalonId(req);
     const key = req.headers['idempotency-key'];
     if (typeof key !== 'string' || key.length < 8) {
@@ -827,21 +1050,37 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
         walkin_token_id: z.string().uuid().optional(),
         discount_paise: z.number().int().min(0).optional(),
         redeem_loyalty_points: z.number().int().min(0).optional(),
-        method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM', 'PREPAID_WALLET', 'SPLIT']),
+        method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM', 'PREPAID_WALLET', 'SPLIT']).optional(),
+        payment_method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM', 'PREPAID_WALLET', 'SPLIT']).optional(),
+        split_payments: z
+          .array(
+            z.object({
+              method: z.enum(['CASH', 'UPI_QR', 'ONLINE_UPI', 'CARD', 'LOYALTY_REDEEM']),
+              amount_paise: z.number().int().positive(),
+            }),
+          )
+          .optional(),
       }),
       req.body,
     );
-    return createInvoice({
+    const chosenMethod = body.payment_method ?? body.method ?? (body.split_payments?.length ? 'SPLIT' : 'CASH');
+    const invoice = await createInvoice({
       salonId,
       actor: req.auth!,
       bookingId: body.booking_id,
       walkinTokenId: body.walkin_token_id,
       discountPaise: body.discount_paise,
       redeemLoyaltyPoints: body.redeem_loyalty_points,
-      method: body.method,
+      method: chosenMethod,
+      splitPayments: body.split_payments,
       idempotencyKey: key,
     });
-  });
+    reply.status(201);
+    return invoice;
+  };
+
+  app.post('/partner/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createInvoiceHandler);
+  app.post('/partner/salons/:id/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, createInvoiceHandler); // API-34
 
   app.get('/partner/invoices', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
@@ -920,49 +1159,213 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- CRM (tenant-isolated) ----------
-  app.get('/partner/crm', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
+  const getCustomersHandler = async (req: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
     const q = parse(
-      z.object({ segment: z.enum(['NEW', 'REGULAR', 'AT_RISK', 'INACTIVE']).optional(), q: z.string().optional() }),
+      z.object({
+        segment: z.enum(['NEW', 'REGULAR', 'AT_RISK', 'INACTIVE']).optional(),
+        q: z.string().optional(),
+        due_within_days: z.coerce.number().int().positive().optional(),
+      }),
       req.query,
     );
     const rows = await withTenant(salonId, (client) =>
       client.query(
-        `SELECT c.*, u.full_name AS customer_name
-           FROM salon_customer_crm c JOIN users u ON u.id = c.customer_id
+        `SELECT c.*,
+                u.full_name AS customer_name,
+                u.email AS customer_email,
+                sm.display_name AS preferred_staff_name
+           FROM salon_customer_crm c
+           JOIN users u ON u.id = c.customer_id
+           LEFT JOIN staff_members sm ON sm.id = c.preferred_staff_id
           WHERE c.salon_id = $1
             AND ($2::text IS NULL OR c.retention_segment::text = $2)
-            AND ($3::text IS NULL OR u.full_name ILIKE $3)
+            AND ($3::text IS NULL OR (u.full_name ILIKE $3 OR c.custom_customer_code ILIKE $3))
+            AND ($4::int IS NULL OR (c.next_expected_visit_date IS NOT NULL AND c.next_expected_visit_date <= (CURRENT_DATE + ($4 || ' days')::interval)::date))
           ORDER BY c.last_visit_at DESC LIMIT 200`,
-        [salonId, q.segment ?? null, q.q ? `%${q.q}%` : null],
+        [salonId, q.segment ?? null, q.q ? `%${q.q}%` : null, q.due_within_days ?? null],
       ),
     ).then((r) => r.rows);
     return { customers: rows };
-  });
+  };
 
-  app.get('/partner/crm/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
-    const salonId = await resolveSalonId(req);
-    const { customerId } = req.params as { customerId: string };
+  app.get('/partner/crm', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomersHandler);
+  app.get('/partner/salons/:id/customers', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomersHandler); // API-29
+
+  const getCustomerDetailHandler = async (req: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
+    const customerId = req.params.cust_id ?? req.params.customerId;
     const crm = await withTenant(salonId, (client) =>
       client.query(
-        `SELECT c.*, u.full_name AS customer_name, u.email
-           FROM salon_customer_crm c JOIN users u ON u.id = c.customer_id
+        `SELECT c.*,
+                u.full_name AS customer_name,
+                u.email,
+                sm.display_name AS preferred_staff_name
+           FROM salon_customer_crm c
+           JOIN users u ON u.id = c.customer_id
+           LEFT JOIN staff_members sm ON sm.id = c.preferred_staff_id
           WHERE c.salon_id = $1 AND c.customer_id = $2`,
         [salonId, customerId],
       ),
     ).then((r) => r.rows[0]);
     if (!crm) throw notFound('Customer not found in this salon CRM');
+
+    // Consent check for STYLE_PHOTO_STORAGE
+    const consent = await one<{ is_granted: boolean }>(
+      `SELECT is_granted FROM customer_consents
+        WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+          AND (salon_id IS NULL OR salon_id = $2)
+        ORDER BY salon_id NULLS LAST LIMIT 1`,
+      [customerId, salonId],
+    );
+    const photoConsentGranted = Boolean(consent?.is_granted);
+
+    const referencePhotos: { key: string; url: string; expires_in: number }[] = [];
+    if (photoConsentGranted && Array.isArray(crm.reference_photo_s3_keys)) {
+      for (const key of crm.reference_photo_s3_keys) {
+        try {
+          const signed = presignGet({ key, expiresSec: 60 });
+          referencePhotos.push({ key, url: signed.url, expires_in: signed.expires_in });
+        } catch {
+          const pub = publicUrlFor(key);
+          if (pub) referencePhotos.push({ key, url: pub, expires_in: 60 });
+        }
+      }
+    }
+
     const visits = await query(
       `SELECT id, booking_code, status, scheduled_start_at, total_payable_paise
-         FROM bookings WHERE salon_id = $1 AND customer_id = $2 ORDER BY scheduled_start_at DESC LIMIT 20`,
+         FROM bookings WHERE salon_id = $1 AND customer_id = $2 ORDER BY scheduled_start_at DESC LIMIT 10`,
       [salonId, customerId],
     );
     const ledger = await query(
       `SELECT * FROM customer_value_ledger WHERE salon_id = $1 AND customer_id = $2 ORDER BY created_at DESC LIMIT 50`,
       [salonId, customerId],
     );
-    return { crm, visits, ledger };
-  });
+
+    return {
+      crm: {
+        ...crm,
+        photo_consent_granted: photoConsentGranted,
+        reference_photos: referencePhotos,
+      },
+      visits,
+      ledger,
+    };
+  };
+
+  app.get('/partner/crm/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomerDetailHandler);
+  app.get('/partner/salons/:id/customers/:cust_id', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getCustomerDetailHandler); // API-30
+
+  const updateStyleVaultHandler = async (req: any, reply: any) => {
+    const salonId = req.params?.id ?? (await resolveSalonId(req));
+    const customerId = req.params.cust_id ?? req.params.customerId;
+    const body = parse(StyleVaultInput, req.body);
+
+    const existing = await withTenant(salonId, (client) =>
+      client.query(
+        `SELECT * FROM salon_customer_crm WHERE salon_id = $1 AND customer_id = $2`,
+        [salonId, customerId],
+      ),
+    ).then((r) => r.rows[0]);
+    if (!existing) throw notFound('Customer not found in this salon CRM');
+
+    const consent = await one<{ is_granted: boolean }>(
+      `SELECT is_granted FROM customer_consents
+        WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+          AND (salon_id IS NULL OR salon_id = $2)
+        ORDER BY salon_id NULLS LAST LIMIT 1`,
+      [customerId, salonId],
+    );
+    const photoConsentGranted = Boolean(consent?.is_granted);
+
+    if ((body.request_photo_upload_count && body.request_photo_upload_count > 0) || body.uploaded_photo_keys?.length || body.reference_photo_s3_keys?.length) {
+      if (!photoConsentGranted) {
+        throw new AppError(403, 'CONSENT_REQUIRED', 'Customer has not consented to reference photo storage (STYLE_PHOTO_STORAGE)');
+      }
+    }
+
+    const uploadUrls: Array<{ upload_url: string; method: string; key: string; expires_in: number }> = [];
+    if (body.request_photo_upload_count && body.request_photo_upload_count > 0) {
+      for (let i = 0; i < body.request_photo_upload_count; i++) {
+        const key = buildObjectKey({ purpose: 'style-vault', userId: customerId, contentType: 'image/jpeg' });
+        if (storageConfigured()) {
+          const presigned = presignPut({ key, expiresSec: 900 });
+          uploadUrls.push(presigned);
+        } else {
+          uploadUrls.push({
+            upload_url: `/uploads/mock/${key}`,
+            method: 'PUT',
+            key,
+            expires_in: 900,
+          });
+        }
+      }
+    }
+
+    const stylePrefs = body.style_preferences ?? body.style_preferences_json;
+    const existingPhotos: string[] = Array.isArray(existing.reference_photo_s3_keys) ? existing.reference_photo_s3_keys : [];
+    const newPhotos = body.reference_photo_s3_keys ?? (
+      body.uploaded_photo_keys?.length
+        ? Array.from(new Set([...existingPhotos, ...body.uploaded_photo_keys]))
+        : undefined
+    );
+
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (body.preferred_staff_id !== undefined) {
+      params.push(body.preferred_staff_id);
+      sets.push(`preferred_staff_id = $${params.length}`);
+    }
+    if (body.preferred_service_ids !== undefined) {
+      params.push(body.preferred_service_ids);
+      sets.push(`preferred_service_ids = $${params.length}`);
+    }
+    if (stylePrefs !== undefined) {
+      params.push(JSON.stringify(stylePrefs));
+      sets.push(`style_preferences_json = $${params.length}`);
+    }
+    if (newPhotos !== undefined) {
+      params.push(newPhotos);
+      sets.push(`reference_photo_s3_keys = $${params.length}`);
+    }
+    sets.push(`updated_at = NOW()`);
+
+    params.push(salonId, customerId);
+    const updated = await withTenant(salonId, (client) =>
+      client.query(
+        `UPDATE salon_customer_crm SET ${sets.join(', ')}
+          WHERE salon_id = $${params.length - 1} AND customer_id = $${params.length} RETURNING *`,
+        params,
+      ),
+    ).then((r) => r.rows[0]);
+
+    const currentPhotos = Array.isArray(updated.reference_photo_s3_keys) ? updated.reference_photo_s3_keys : [];
+    const signedPhotos = photoConsentGranted
+      ? currentPhotos.map((k: string) => {
+          try {
+            return presignGet({ key: k, expiresSec: 60 });
+          } catch {
+            return { key: k, url: publicUrlFor(k) ?? '', expires_in: 60 };
+          }
+        })
+      : [];
+
+    reply.status(200);
+    return {
+      style_vault: {
+        ...updated,
+        photo_consent_granted: photoConsentGranted,
+        reference_photos: signedPhotos,
+      },
+      upload_urls: uploadUrls,
+    };
+  };
+
+  app.put('/partner/salons/:id/customers/:cust_id/style-vault', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, updateStyleVaultHandler); // API-31
+  app.put('/partner/crm/:customerId/style-vault', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, updateStyleVaultHandler);
+  app.patch('/partner/crm/:customerId/style-vault', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, updateStyleVaultHandler);
 
   app.patch('/partner/crm/:customerId', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
@@ -978,6 +1381,19 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       }),
       req.body,
     );
+
+    if (body.reference_photo_s3_keys?.length) {
+      const consent = await one<{ is_granted: boolean }>(
+        `SELECT is_granted FROM customer_consents
+          WHERE user_id = $1 AND purpose = 'STYLE_PHOTO_STORAGE'
+            AND (salon_id IS NULL OR salon_id = $2)
+          ORDER BY salon_id NULLS LAST LIMIT 1`,
+        [customerId, salonId],
+      );
+      if (!consent || !consent.is_granted) {
+        throw new AppError(403, 'CONSENT_REQUIRED', 'Customer has not consented to reference photo storage (STYLE_PHOTO_STORAGE)');
+      }
+    }
 
     const map: [string, unknown][] = [
       ['preferred_staff_id', body.preferred_staff_id],
@@ -1010,21 +1426,24 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ---------- Retention reminders ----------
-  app.get('/partner/reminders', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  const getRemindersHandler = async (req: any) => {
     const salonId = await resolveSalonId(req);
     const q = parse(z.object({ status: z.string().optional(), from: z.string().optional() }), req.query);
     return listReminders(salonId, {
       status: q.status ? q.status.split(',') : undefined,
       from: q.from,
     });
-  });
+  };
+
+  app.get('/partner/reminders', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getRemindersHandler);
+  app.get('/partner/salons/:id/reminders', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, getRemindersHandler); // API-32
 
   app.get('/partner/reminders/analytics', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);
     return { funnel: await reminderFunnel(salonId) };
   });
 
-  app.post('/partner/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
+  const triggerRemindersHandler = async (req: any) => {
     const salonId = await resolveSalonId(req);
     const body = parse(
       z.object({
@@ -1042,7 +1461,10 @@ export const partnerRoutes: FastifyPluginAsync = async (app) => {
       templateCode: body.template_code,
       serviceCategoryId: body.service_category_id,
     });
-  });
+  };
+
+  app.post('/partner/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, triggerRemindersHandler);
+  app.post('/partner/salons/:id/reminders/trigger', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, triggerRemindersHandler); // API-33
 
   app.post('/partner/reminders/dispatch', { preHandler: [authenticate, requireRole(...PARTNER_ROLES)] }, async (req) => {
     const salonId = await resolveSalonId(req);

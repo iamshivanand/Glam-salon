@@ -1,12 +1,26 @@
 import { one, tx } from '../db.js';
 import { badRequest, conflict, notFound } from '../http.js';
 import { randomToken } from '../crypto.js';
-import { scheduleReminders } from './reminders.js';
+import { scheduleReminders, calculateAdaptiveInterval } from './reminders.js';
 import { queueTransactional } from './transactional.js';
 
 const GST_RATE = 0.18;
 const POINT_VALUE_PAISE = 100; // 1 loyalty point = ₹1
 const POINTS_PER_RUPEE = 1 / 100; // earn 1 point per ₹100
+
+export function calculateLoyaltyEarned(netPaise: number): number {
+  return Math.floor(Math.max(0, netPaise) / 10000);
+}
+
+export function calculateLoyaltyRedemptionValue(points: number): number {
+  return Math.max(0, points) * POINT_VALUE_PAISE;
+}
+
+export interface SplitPaymentDetail {
+  method: 'CASH' | 'UPI_QR' | 'CARD' | 'ONLINE_UPI' | 'LOYALTY_REDEEM';
+  amount_paise?: number;
+  amountPaise?: number;
+}
 
 export interface InvoiceInput {
   salonId: string;
@@ -16,7 +30,49 @@ export interface InvoiceInput {
   discountPaise?: number;
   redeemLoyaltyPoints?: number;
   method: string;
+  splitPayments?: SplitPaymentDetail[];
   idempotencyKey: string;
+}
+
+export function calculateInvoiceTotals(opts: {
+  grossPaise: number;
+  discountPaise?: number;
+  loyaltyRedeemedPaise?: number;
+  gstRate?: number;
+  commissionBps: number;
+}) {
+  const gross = Math.max(0, opts.grossPaise);
+  const discount = Math.min(gross, Math.max(0, opts.discountPaise ?? 0));
+  const loyalty = Math.min(gross - discount, Math.max(0, opts.loyaltyRedeemedPaise ?? 0));
+  const taxable = Math.max(0, gross - discount - loyalty);
+  const tax = Math.round(taxable * (opts.gstRate ?? GST_RATE));
+  const net = taxable + tax;
+  const commission = Math.round((net * opts.commissionBps) / 10000);
+  const partnerSettlement = net - commission;
+  return { gross, discount, loyalty, taxable, tax, net, commission, partnerSettlement };
+}
+
+export function validateSplitPayments(
+  splitPayments: SplitPaymentDetail[] | undefined,
+  expectedNetPaise: number,
+): { method: string; amount_paise: number }[] {
+  if (!Array.isArray(splitPayments) || splitPayments.length < 2) {
+    throw badRequest('INVALID_SPLIT_PAYMENT', 'Split payment requires at least two payment components');
+  }
+  const splitSum = splitPayments.reduce(
+    (sum: number, p) => sum + Number(p.amount_paise ?? p.amountPaise ?? 0),
+    0,
+  );
+  if (splitSum !== expectedNetPaise) {
+    throw badRequest(
+      'SPLIT_AMOUNT_MISMATCH',
+      `Sum of split payments (₹${(splitSum / 100).toFixed(2)}) must exactly equal net payable amount (₹${(expectedNetPaise / 100).toFixed(2)})`,
+    );
+  }
+  return splitPayments.map((p) => ({
+    method: p.method,
+    amount_paise: Number(p.amount_paise ?? p.amountPaise),
+  }));
 }
 
 export async function createInvoice(input: InvoiceInput) {
@@ -92,7 +148,7 @@ export async function createInvoice(input: InvoiceInput) {
       const requestedPoints = Math.max(0, input.redeemLoyaltyPoints ?? 0);
       const maxRedeemable = Math.floor((gross - discount) / POINT_VALUE_PAISE);
       const redeemPoints = Math.min(requestedPoints, availablePoints, maxRedeemable);
-      const loyaltyRedeemed = redeemPoints * POINT_VALUE_PAISE;
+      const loyaltyRedeemed = calculateLoyaltyRedemptionValue(redeemPoints);
 
       const taxable = Math.max(0, gross - discount - loyaltyRedeemed);
       const tax = Math.round(taxable * GST_RATE);
@@ -106,36 +162,120 @@ export async function createInvoice(input: InvoiceInput) {
       const commission = Math.round((net * bps) / 10000);
       const partnerSettlement = net - commission;
 
-      const invoiceNumber = `INV-${input.salonId.slice(0, 4).toUpperCase()}-${new Date().getUTCFullYear()}-${randomToken(3).toUpperCase()}`;
-      const invoice = (
-        await client.query(
-          `INSERT INTO invoices_and_payments
-             (invoice_number, idempotency_key, salon_id, customer_id, booking_id, walkin_token_id,
-              gross_amount_paise, discount_paise, loyalty_redeemed_paise, wallet_redeemed_paise,
-              tax_paise, net_collected_paise, platform_commission_paise, partner_net_settlement_paise,
-              method, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,'CAPTURED')
-           RETURNING *`,
-          [
-            invoiceNumber,
-            input.idempotencyKey,
-            input.salonId,
-            customerId,
-            bookingId,
-            walkinTokenId,
-            gross,
-            discount,
-            loyaltyRedeemed,
-            tax,
-            net,
-            commission,
-            partnerSettlement,
-            input.method,
-          ],
-        )
-      ).rows[0];
+      let gatewayOrderId: string | null = null;
+      let gatewayPaymentId: string | null = null;
+      let finalMethod = input.method;
 
-      const intervalDays =
+      // 1. Detect if customer pre-paid online at booking time via payment_orders
+      if (bookingId) {
+        const prepaidOrder = (
+          await client.query<{
+            id: string;
+            provider_order_id: string | null;
+            provider_payment_id: string | null;
+            amount_paise: number;
+          }>(
+            `SELECT id, provider_order_id, provider_payment_id, amount_paise
+               FROM payment_orders
+              WHERE booking_id = $1 AND salon_id = $2 AND status = 'PAID'
+              ORDER BY created_at DESC LIMIT 1`,
+            [bookingId, input.salonId],
+          )
+        ).rows[0];
+
+        if (prepaidOrder) {
+          finalMethod = 'ONLINE_UPI';
+          gatewayOrderId = prepaidOrder.provider_order_id ?? null;
+          gatewayPaymentId = prepaidOrder.provider_payment_id ?? null;
+        }
+      }
+
+      // 2. Handle split payment flow if method is SPLIT or splitPayments provided
+      const rawSplit = input.splitPayments ?? (input as any).split_payments;
+      let splitPaymentsJson: { method: string; amount_paise: number }[] = [];
+      if (!gatewayPaymentId && (finalMethod === 'SPLIT' || (Array.isArray(rawSplit) && rawSplit.length > 0))) {
+        finalMethod = 'SPLIT';
+        splitPaymentsJson = validateSplitPayments(rawSplit, net);
+      }
+
+      const invoiceNumber = `INV-${input.salonId.slice(0, 4).toUpperCase()}-${new Date().getUTCFullYear()}-${randomToken(3).toUpperCase()}`;
+      let invoice: any;
+      try {
+        invoice = (
+          await client.query(
+            `INSERT INTO invoices_and_payments
+               (invoice_number, idempotency_key, salon_id, customer_id, booking_id, walkin_token_id,
+                gross_amount_paise, discount_paise, loyalty_redeemed_paise, wallet_redeemed_paise,
+                tax_paise, net_collected_paise, platform_commission_paise, partner_net_settlement_paise,
+                method, status, gateway_order_id, gateway_payment_id, split_details_json)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,'CAPTURED',$15,$16,$17::jsonb)
+             RETURNING *`,
+            [
+              invoiceNumber,
+              input.idempotencyKey,
+              input.salonId,
+              customerId,
+              bookingId,
+              walkinTokenId,
+              gross,
+              discount,
+              loyaltyRedeemed,
+              tax,
+              net,
+              commission,
+              partnerSettlement,
+              finalMethod,
+              gatewayOrderId,
+              gatewayPaymentId,
+              JSON.stringify(splitPaymentsJson),
+            ],
+          )
+        ).rows[0];
+      } catch (err: any) {
+        if (err.code === '42703') {
+          // split_details_json column fallback for unmigrated environments
+          invoice = (
+            await client.query(
+              `INSERT INTO invoices_and_payments
+                 (invoice_number, idempotency_key, salon_id, customer_id, booking_id, walkin_token_id,
+                  gross_amount_paise, discount_paise, loyalty_redeemed_paise, wallet_redeemed_paise,
+                  tax_paise, net_collected_paise, platform_commission_paise, partner_net_settlement_paise,
+                  method, status, gateway_order_id, gateway_payment_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,'CAPTURED',$15,$16)
+               RETURNING *`,
+              [
+                invoiceNumber,
+                input.idempotencyKey,
+                input.salonId,
+                customerId,
+                bookingId,
+                walkinTokenId,
+                gross,
+                discount,
+                loyaltyRedeemed,
+                tax,
+                net,
+                commission,
+                partnerSettlement,
+                finalMethod,
+                gatewayOrderId,
+                gatewayPaymentId,
+              ],
+            )
+          ).rows[0];
+        } else {
+          throw err;
+        }
+      }
+
+      if (bookingId && gatewayPaymentId) {
+        await client.query(
+          `UPDATE payment_orders SET invoice_id = $1 WHERE booking_id = $2 AND status = 'PAID'`,
+          [invoice.id, bookingId],
+        );
+      }
+
+      const baseServiceInterval =
         (
           await client.query(
             `SELECT COALESCE(s.reminder_interval_days, c.default_reminder_interval_days, 25)::int AS days
@@ -149,8 +289,37 @@ export async function createInvoice(input: InvoiceInput) {
           )
         ).rows[0]?.days ?? 25;
 
-      const earnedPoints = Math.floor(net * POINTS_PER_RUPEE / 100) || Math.floor(net / 10000);
-      const nextExpected = new Date(Date.now() + intervalDays * 86_400_000).toISOString().slice(0, 10);
+      const existingCrm = (
+        await client.query<{
+          last_visit_at: Date | null;
+          computed_visit_interval_days: number | null;
+          total_visits: number;
+        }>(
+          `SELECT last_visit_at, computed_visit_interval_days, total_visits
+             FROM salon_customer_crm
+            WHERE salon_id = $1 AND customer_id = $2`,
+          [input.salonId, customerId],
+        )
+      ).rows[0];
+
+      // F1.12 Adaptive Next-Visit Interval Formula (EWMA):
+      // On visit N = 1, uses service reminder_interval_days clamped to [7, 90].
+      // For N >= 2, computes Interval_new = round(0.7 * ActualDaysSinceLastVisit + 0.3 * Interval_old) clamped to [7, 90].
+      let actualDaysSinceLastVisit: number | null = null;
+      if (existingCrm?.last_visit_at) {
+        const ms = Date.now() - new Date(existingCrm.last_visit_at).getTime();
+        actualDaysSinceLastVisit = Math.max(1, Math.round(ms / 86_400_000));
+      }
+      const isRepeatVisit = Boolean(existingCrm && (existingCrm.total_visits >= 1 || existingCrm.last_visit_at));
+      const effectiveIntervalDays = calculateAdaptiveInterval({
+        actualDaysSinceLastVisit,
+        previousIntervalDays: existingCrm?.computed_visit_interval_days,
+        baseServiceIntervalDays: baseServiceInterval,
+        isRepeatVisit,
+      });
+
+      const earnedPoints = calculateLoyaltyEarned(net);
+      const nextExpected = new Date(Date.now() + effectiveIntervalDays * 86_400_000).toISOString().slice(0, 10);
 
       await client.query(
         `INSERT INTO salon_customer_crm
@@ -175,7 +344,7 @@ export async function createInvoice(input: InvoiceInput) {
           `CUST-${customerId.slice(0, 6).toUpperCase()}`,
           nextExpected,
           net,
-          intervalDays,
+          effectiveIntervalDays,
           earnedPoints,
           redeemPoints,
         ],
@@ -221,7 +390,7 @@ export async function createInvoice(input: InvoiceInput) {
           bookingId,
           serviceCategoryId,
           completedAt: new Date(),
-          intervalDays,
+          intervalDays: effectiveIntervalDays,
         });
       }
 
@@ -240,7 +409,13 @@ export async function createInvoice(input: InvoiceInput) {
         );
       }
 
-      return { ...invoice, earned_points: earnedPoints, redeemed_points: redeemPoints };
+      return {
+        ...invoice,
+        earned_points: earnedPoints,
+        redeemed_points: redeemPoints,
+        split_details: splitPaymentsJson,
+        is_prepaid: Boolean(gatewayPaymentId),
+      };
     });
 
     const customer = await one<{ full_name: string }>(`SELECT full_name FROM users WHERE id = $1`, [result.customer_id]);

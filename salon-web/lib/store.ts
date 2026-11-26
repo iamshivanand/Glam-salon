@@ -19,6 +19,7 @@ interface AuthState {
   hydrated: boolean;
   requestOtp: (phone: string) => Promise<{ challenge_id: string; dev_otp?: string; expires_in: number }>;
   verifyOtp: (challengeId: string, otp: string, fullName?: string) => Promise<SessionUser>;
+  loginWithOAuth: (provider: 'google' | 'apple', id_token: string, fullName?: string) => Promise<SessionUser>;
   logout: () => Promise<void>;
   setHydrated: () => void;
 }
@@ -38,6 +39,15 @@ export const useAuth = create<AuthState>()(
         const res = await api<{ access_token: string; user: SessionUser }>('/auth/otp/verify', {
           method: 'POST',
           body: { challenge_id: challengeId, otp, full_name: fullName },
+        });
+        setToken(res.access_token);
+        set({ token: res.access_token, user: res.user });
+        return res.user;
+      },
+      loginWithOAuth: async (provider, id_token, fullName) => {
+        const res = await api<{ access_token: string; user: SessionUser }>('/auth/oauth/callback', {
+          method: 'POST',
+          body: { provider, id_token, full_name: fullName },
         });
         setToken(res.access_token);
         set({ token: res.access_token, user: res.user });

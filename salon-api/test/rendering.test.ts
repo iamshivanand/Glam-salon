@@ -54,6 +54,21 @@ test('queue and payment templates carry the token/amount', () => {
   });
   assert.match(receipt.text, /₹2450\.00/);
   assert.match(receipt.text, /GC9999/);
+
+  const kycApproved = renderTransactional('KYC_APPROVED', {
+    customerName: 'Ananya',
+    salonName: 'The Glow Room',
+  });
+  assert.match(kycApproved.subject, /Salon verification approved/);
+  assert.match(kycApproved.text, /active on the marketplace/);
+
+  const kycRejected = renderTransactional('KYC_REJECTED', {
+    customerName: 'Ananya',
+    salonName: 'The Glow Room',
+    reason: 'Shop license illegible',
+  });
+  assert.match(kycRejected.subject, /Salon verification update/);
+  assert.match(kycRejected.text, /Shop license illegible/);
 });
 
 test('reminder rendering links through the click tracker and lowercases the service', () => {

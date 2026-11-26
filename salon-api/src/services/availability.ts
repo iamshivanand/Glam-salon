@@ -1,5 +1,6 @@
 import { one, query } from '../db.js';
 import { badRequest, conflict, notFound } from '../http.js';
+import { redis } from '../redis.js';
 
 export const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 export const SLOT_STEP_MINS = 15;
@@ -167,6 +168,20 @@ export async function computeAvailability(opts: {
       end: new Date(b.end).getTime(),
     }));
 
+    const walkins = await query<{ start: string; duration: number }>(
+      `SELECT COALESCE(service_started_at, called_at, NOW()) AS start, total_duration_mins AS duration
+         FROM walkin_queue_tokens
+        WHERE assigned_staff_id = $1
+          AND queue_date = $2
+          AND status IN ('CALLED', 'IN_SERVICE')`,
+      [staffId, opts.dateISO],
+    );
+    for (const w of walkins) {
+      const start = new Date(w.start).getTime();
+      const end = start + Math.max(15, w.duration || 15) * 60_000;
+      bookedRanges.push({ start, end });
+    }
+
     let resources: { id: string; resource_type: string }[] = [];
     let resourceBooked: { resource_id: string; start: number; end: number }[] = [];
     if (requiredTypes.length) {
@@ -188,6 +203,21 @@ export async function computeAvailability(opts: {
         start: new Date(r.start).getTime(),
         end: new Date(r.end).getTime(),
       }));
+
+      const walkinResources = await query<{ resource_id: string; start: string; duration: number }>(
+        `SELECT assigned_resource_id AS resource_id, COALESCE(service_started_at, called_at, NOW()) AS start, total_duration_mins AS duration
+           FROM walkin_queue_tokens
+          WHERE salon_id = $1
+            AND queue_date = $2
+            AND assigned_resource_id IS NOT NULL
+            AND status IN ('CALLED', 'IN_SERVICE')`,
+        [opts.salonId, opts.dateISO],
+      );
+      for (const wr of walkinResources) {
+        const start = new Date(wr.start).getTime();
+        const end = start + Math.max(15, wr.duration || 15) * 60_000;
+        resourceBooked.push({ resource_id: wr.resource_id, start, end });
+      }
     }
 
     const stepMs = SLOT_STEP_MINS * 60_000;
@@ -224,21 +254,80 @@ export async function computeAvailability(opts: {
   }
 
   slots.sort((a, b) => a.start_at.localeCompare(b.start_at));
+  void syncSalonAvailabilityBitmap(opts.salonId, opts.dateISO, slots).catch(() => {});
   return { date: opts.dateISO, total_duration_mins: duration, slots };
 }
 
+export async function syncSalonAvailabilityBitmap(
+  salonId: string,
+  dateISO: string,
+  slots: { start_at: string }[],
+): Promise<void> {
+  const key = `avail:bitmap:${salonId}:${dateISO}`;
+  const dayStartUtc = new Date(`${dateISO}T00:00:00+05:30`).getTime();
+  const pipe = redis.pipeline();
+  pipe.del(key);
+  const seenBits = new Set<number>();
+  for (const slot of slots) {
+    const t = new Date(slot.start_at).getTime();
+    const bit = Math.floor((t - dayStartUtc) / (15 * 60_000));
+    if (bit >= 0 && bit < 96 && !seenBits.has(bit)) {
+      seenBits.add(bit);
+      pipe.setbit(key, bit, 1);
+    }
+  }
+  pipe.expire(key, 300); // 5 min TTL
+  await pipe.exec().catch(() => {});
+}
+
+export async function hasSlotsInWindowBitmap(
+  salonId: string,
+  dateISO: string,
+  startMs: number,
+  endMs: number,
+): Promise<boolean | null> {
+  const key = `avail:bitmap:${salonId}:${dateISO}`;
+  const exists = await redis.exists(key);
+  if (!exists) return null; // Cache miss; need full compute
+
+  const dayStartUtc = new Date(`${dateISO}T00:00:00+05:30`).getTime();
+  const minBit = Math.max(0, Math.floor((startMs - dayStartUtc) / (15 * 60_000)));
+  const maxBit = Math.min(95, Math.floor((endMs - dayStartUtc) / (15 * 60_000)));
+  if (minBit > maxBit) return false;
+
+  const pipe = redis.pipeline();
+  for (let bit = minBit; bit <= maxBit; bit++) {
+    pipe.getbit(key, bit);
+  }
+  const results = await pipe.exec();
+  if (!results) return null;
+  return results.some(([_, val]) => Number(val) === 1);
+}
+
 export async function nextAvailableSlot(salonId: string): Promise<string | null> {
+  const cacheKey = `salon:next_slot:${salonId}`;
+  const cached = await redis.get(cacheKey).catch(() => null);
+  if (cached !== null) return cached === 'none' ? null : cached;
+
   const service = await one<{ id: string }>(
     `SELECT id FROM salon_services WHERE salon_id = $1 AND is_active = TRUE ORDER BY duration_mins LIMIT 1`,
     [salonId],
   );
-  if (!service) return null;
+  if (!service) {
+    await redis.set(cacheKey, 'none', 'EX', 180).catch(() => {});
+    return null;
+  }
   for (let i = 0; i < 7; i++) {
     const d = new Date(Date.now() + i * 86_400_000 + IST_OFFSET_MS);
     const dateISO = d.toISOString().slice(0, 10);
     const result = await computeAvailability({ salonId, serviceIds: [service.id], dateISO });
-    if (result.slots.length) return result.slots[0].start_at;
+    if (result.slots.length) {
+      const slot = result.slots[0].start_at;
+      await redis.set(cacheKey, slot, 'EX', 180).catch(() => {});
+      return slot;
+    }
   }
+  await redis.set(cacheKey, 'none', 'EX', 180).catch(() => {});
   return null;
 }
 

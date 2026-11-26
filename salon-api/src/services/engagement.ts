@@ -41,7 +41,7 @@ function statusRank(status: string): number {
 }
 
 /** A public click can only move engagement forward; it never un-converts a booking. */
-function advanceStatus(current: string, next: ReminderStatus): ReminderStatus {
+export function advanceStatus(current: string, next: ReminderStatus): ReminderStatus {
   if (current === 'CONVERTED_TO_BOOKING') return current as ReminderStatus;
   return statusRank(next) >= statusRank(current) ? next : (current as ReminderStatus);
 }
@@ -98,11 +98,13 @@ export async function attributeReminderBooking(
     `UPDATE retention_reminders
         SET status = 'CONVERTED_TO_BOOKING',
             converted_at = NOW(),
-            clicked_at = COALESCE(clicked_at, NOW())
+            clicked_at = COALESCE(clicked_at, NOW()),
+            attributed_booking_id = $3,
+            updated_at = NOW()
       WHERE deep_link_token = $1
         AND salon_id = $2
       RETURNING id`,
-    [opts.token, opts.salonId],
+    [opts.token, opts.salonId, opts.bookingId],
   );
   const reminder = updated.rows[0];
   if (!reminder) return;
@@ -149,9 +151,9 @@ export async function applyDeliveryEvent(opts: {
   return withIntegration(async (client) => {
     const found = await client.query<{ id: string; status: ReminderStatus }>(
       `SELECT id, status FROM retention_reminders
-        WHERE provider = $1 AND provider_message_id = $2
+        WHERE provider_message_id = $1
         FOR UPDATE`,
-      [opts.provider, opts.messageId],
+      [opts.messageId],
     );
     const reminder = found.rows[0];
     if (!reminder) return false;
@@ -162,7 +164,8 @@ export async function applyDeliveryEvent(opts: {
           SET status = $2,
               delivered_at = CASE WHEN $2 = 'DELIVERED' THEN COALESCE(delivered_at, NOW()) ELSE delivered_at END,
               opened_at = CASE WHEN $2 = 'OPENED' THEN COALESCE(opened_at, NOW()) ELSE opened_at END,
-              last_error = CASE WHEN $2 = 'FAILED' THEN $3 ELSE last_error END
+              last_error = CASE WHEN $2 = 'FAILED' THEN $3 ELSE last_error END,
+              updated_at = NOW()
         WHERE id = $1`,
       [reminder.id, newStatus, opts.providerStatus ?? null],
     );

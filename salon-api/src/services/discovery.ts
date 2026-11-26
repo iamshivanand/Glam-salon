@@ -1,6 +1,7 @@
 import { one, query } from '../db.js';
+import { redis } from '../redis.js';
 import { badRequest, notFound } from '../http.js';
-import { computeAvailability, nextAvailableSlot, fmtLocalDate } from './availability.js';
+import { computeAvailability, nextAvailableSlot, fmtLocalDate, hasSlotsInWindowBitmap } from './availability.js';
 
 const IST_TZ = 'Asia/Kolkata';
 
@@ -80,12 +81,12 @@ export async function searchSalons(input: SearchInput) {
 
   const order =
     input.sort === 'rating'
-      ? 's.avg_rating DESC, s.review_count DESC'
+      ? 's.is_sponsored DESC, s.avg_rating DESC, s.review_count DESC'
       : input.sort === 'price'
-        ? 'starting_price_paise ASC NULLS LAST'
+        ? 's.is_sponsored DESC, starting_price_paise ASC NULLS LAST'
         : distanceExpr !== 'NULL::double precision'
-          ? 'distance_km ASC NULLS LAST'
-          : 's.avg_rating DESC';
+          ? 's.is_sponsored DESC, distance_km ASC NULLS LAST'
+          : 's.is_sponsored DESC, s.avg_rating DESC';
 
   params.push(input.pageSize, (input.page - 1) * input.pageSize);
   const limitIdx = params.length - 1;
@@ -121,31 +122,32 @@ export async function searchSalons(input: SearchInput) {
   );
   const queueBySalon = new Map(queueRows.map((r) => [r.salon_id, r]));
 
-  const salons = [];
-  for (const row of rows) {
-    const q = queueBySalon.get(row.id);
-    salons.push({
-      id: row.id,
-      name: row.name,
-      slug: row.slug,
-      description: row.description,
-      salon_type: row.salon_type,
-      address_line: row.address_line,
-      locality: row.locality,
-      city: row.city,
-      distance_km: row.distance_km != null ? Number(Number(row.distance_km).toFixed(2)) : null,
-      avg_rating: Number(row.avg_rating),
-      review_count: row.review_count,
-      is_sponsored: row.is_sponsored,
-      hygiene_badges: hygieneBadges(row),
-      starting_price_paise: row.starting_price_paise ?? null,
-      next_available_slot: await nextAvailableSlot(row.id),
-      live_queue: {
-        waiting_count: q?.waiting_count ?? 0,
-        estimated_wait_mins: q?.estimated_wait_mins ?? 0,
-      },
-    });
-  }
+  const salons = await Promise.all(
+    rows.map(async (row) => {
+      const q = queueBySalon.get(row.id);
+      return {
+        id: row.id,
+        name: row.name,
+        slug: row.slug,
+        description: row.description,
+        salon_type: row.salon_type,
+        address_line: row.address_line,
+        locality: row.locality,
+        city: row.city,
+        distance_km: row.distance_km != null ? Number(Number(row.distance_km).toFixed(2)) : null,
+        avg_rating: Number(row.avg_rating),
+        review_count: row.review_count,
+        is_sponsored: row.is_sponsored,
+        hygiene_badges: hygieneBadges(row),
+        starting_price_paise: row.starting_price_paise ?? null,
+        next_available_slot: await nextAvailableSlot(row.id),
+        live_queue: {
+          waiting_count: q?.waiting_count ?? 0,
+          estimated_wait_mins: q?.estimated_wait_mins ?? 0,
+        },
+      };
+    }),
+  );
 
   return { meta: { total: Number(total?.total ?? 0), page: input.page, page_size: input.pageSize }, salons };
 }
@@ -165,7 +167,20 @@ export async function compareSalons(salonIds: string[], categoryId: string) {
         ORDER BY COALESCE(discounted_price_paise, base_price_paise) ASC LIMIT 1`,
       [salonId, categoryId],
     );
-    const facilities = await one(`SELECT * FROM salon_hygiene_facilities WHERE salon_id = $1`, [salonId]);
+    const facilities = await one(
+      `SELECT h.*, u.full_name AS verified_by_admin_name
+         FROM salon_hygiene_facilities h
+         LEFT JOIN users u ON u.id = h.verified_by_admin_id
+        WHERE h.salon_id = $1`,
+      [salonId],
+    );
+    const queue = await one<{ waiting_count: number; estimated_wait_mins: number }>(
+      `SELECT COUNT(*)::int AS waiting_count,
+              COALESCE(MIN(estimated_wait_mins), 0)::int AS estimated_wait_mins
+         FROM walkin_queue_tokens
+        WHERE salon_id = $1 AND queue_date = CURRENT_DATE AND status = 'WAITING'`,
+      [salonId],
+    );
     const slot = await nextAvailableSlot(salonId);
     comparison.push({
       salon_id: salon.id,
@@ -181,10 +196,13 @@ export async function compareSalons(salonIds: string[], categoryId: string) {
             autoclave_sterilization: facilities.autoclave_sterilization,
             wheelchair_accessible: facilities.wheelchair_accessible,
             has_women_only_zone: facilities.has_women_only_zone,
+            verified_by_admin_name: facilities.verified_by_admin_name ?? null,
+            verified_at: facilities.verified_at ?? null,
           }
         : null,
       next_slot: slot ? slot.slice(11, 16) : null,
-      queue_wait_mins: 0,
+      queue_wait_mins: queue?.estimated_wait_mins ?? 0,
+      queue_waiting_count: queue?.waiting_count ?? 0,
     });
   }
   return { category: category.name, comparison };
@@ -201,8 +219,18 @@ export async function urgentSlots(input: {
   const now = Date.now();
   const deadline = now + within * 60_000;
 
+  const cacheKey = `urgent:${input.lat?.toFixed(2) ?? '0'}:${input.lng?.toFixed(2) ?? '0'}:${input.radiusKm ?? 15}:${input.categoryId ?? 'all'}:${within}`;
+  const cached = await redis.get(cacheKey).catch(() => null);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch {}
+  }
+
   const params: unknown[] = [];
   const where = [`s.is_active = TRUE`, `s.verification_status = 'APPROVED'`];
+  let selectDistance = `NULL::numeric AS distance_km`;
+
   if (typeof input.lat === 'number' && typeof input.lng === 'number') {
     params.push(input.lng, input.lat);
     const lngIdx = params.length - 1;
@@ -211,6 +239,7 @@ export async function urgentSlots(input: {
     where.push(
       `ST_DWithin(s.geo_point, ST_SetSRID(ST_MakePoint($${lngIdx}, $${latIdx}), 4326)::geography, $${params.length})`,
     );
+    selectDistance = `ROUND((ST_Distance(s.geo_point, ST_SetSRID(ST_MakePoint($${lngIdx}, $${latIdx}), 4326)::geography) / 1000)::numeric, 2) AS distance_km`;
   }
   if (input.categoryId) {
     params.push(input.categoryId);
@@ -219,54 +248,100 @@ export async function urgentSlots(input: {
     );
   }
 
-  const salons = await query(`SELECT s.* FROM salons s WHERE ${where.join(' AND ')} LIMIT 50`, params);
-  const matches = [];
+  const salons = await query<any>(
+    `SELECT s.*, ${selectDistance} FROM salons s WHERE ${where.join(' AND ')} LIMIT 15`,
+    params,
+  );
 
-  for (const salon of salons) {
-    const service = await one<{ id: string; custom_name: string; base_price_paise: number; discounted_price_paise: number | null }>(
-      `SELECT id, custom_name, base_price_paise, discounted_price_paise
-         FROM salon_services
-        WHERE salon_id = $1 AND is_active = TRUE
-          AND ($2::uuid IS NULL OR category_id = $2)
-        ORDER BY duration_mins ASC LIMIT 1`,
-      [salon.id, input.categoryId ?? null],
-    );
-    if (!service) continue;
+  const evaluatedMatches = await Promise.all(
+    salons.map(async (salon) => {
+      const service = await one<{ id: string; custom_name: string; base_price_paise: number; discounted_price_paise: number | null }>(
+        `SELECT id, custom_name, base_price_paise, discounted_price_paise
+           FROM salon_services
+          WHERE salon_id = $1 AND is_active = TRUE
+            AND ($2::uuid IS NULL OR category_id = $2)
+          ORDER BY duration_mins ASC LIMIT 1`,
+        [salon.id, input.categoryId ?? null],
+      );
+      if (!service) return null;
 
-    for (const offset of [0, 1]) {
-      const dateISO = fmtLocalDate(new Date(now + offset * 86_400_000));
-      const availability = await computeAvailability({ salonId: salon.id, serviceIds: [service.id], dateISO });
-      const slot = availability.slots.find((s) => {
-        const t = new Date(s.start_at).getTime();
-        return t >= now && t <= deadline;
-      });
-      if (slot) {
-        matches.push({
-          salon_id: salon.id,
-          salon_name: salon.name,
-          distance_km: null,
-          travel_eta_mins: 10,
-          earliest_slot_start: slot.start_at,
-          starts_in_mins: Math.max(0, Math.round((new Date(slot.start_at).getTime() - now) / 60_000)),
-          staff_id: slot.staff_id,
-          staff_name: null,
-          price_paise: service.discounted_price_paise ?? service.base_price_paise,
-          flash_deal_discount_paise: 0,
-          instant_confirm_guaranteed: slot.instant_confirm,
+      for (const offset of [0, 1]) {
+        const dateISO = fmtLocalDate(new Date(now + offset * 86_400_000));
+        // Sub-5ms Redis 96-bit daily bitmap availability check
+        const hasSlot = await hasSlotsInWindowBitmap(salon.id, dateISO, now, deadline);
+        if (hasSlot === false) {
+          continue;
+        }
+
+        const availability = await computeAvailability({ salonId: salon.id, serviceIds: [service.id], dateISO });
+        const slot = availability.slots.find((s) => {
+          const t = new Date(s.start_at).getTime();
+          return t >= now && t <= deadline;
         });
-        break;
-      }
-    }
-  }
+        if (slot) {
+          const distKm = salon.distance_km != null ? Number(salon.distance_km) : null;
+          const travelEta = distKm != null ? Math.max(5, Math.round((distKm / 25) * 60) + 5) : 15;
 
+          let staffName: string | null = null;
+          if (slot.staff_id) {
+            const staffRow = await one<{ display_name: string }>(
+              `SELECT display_name FROM staff_members WHERE id = $1`,
+              [slot.staff_id],
+            );
+            staffName = staffRow?.display_name ?? null;
+          }
+
+          const basePrice = service.base_price_paise;
+          const finalPrice = service.discounted_price_paise ?? basePrice;
+          const flashDiscount =
+            service.discounted_price_paise && basePrice > service.discounted_price_paise
+              ? basePrice - service.discounted_price_paise
+              : 0;
+
+          return {
+            salon_id: salon.id,
+            salon_name: salon.name,
+            distance_km: distKm,
+            travel_eta_mins: travelEta,
+            earliest_slot_start: slot.start_at,
+            starts_in_mins: Math.max(0, Math.round((new Date(slot.start_at).getTime() - now) / 60_000)),
+            staff_id: slot.staff_id,
+            staff_name: staffName,
+            price_paise: finalPrice,
+            flash_deal_discount_paise: flashDiscount,
+            instant_confirm_guaranteed: slot.instant_confirm,
+          };
+        }
+      }
+      return null;
+    }),
+  );
+
+  const matches = evaluatedMatches.filter((m): m is NonNullable<typeof m> => m !== null);
   matches.sort((a, b) => a.starts_in_mins - b.starts_in_mins);
-  return { urgent_matches: matches.slice(0, 20) };
+  const result = { urgent_matches: matches.slice(0, 20) };
+  await redis.set(cacheKey, JSON.stringify(result), 'EX', 20).catch(() => {});
+  return result;
 }
 
 export async function salonProfile(salonId: string): Promise<Record<string, any>> {
+  const cacheKey = `salon:profile:${salonId}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch {}
+  }
+
   const salon = await one(`SELECT * FROM salons WHERE id = $1`, [salonId]);
   if (!salon) throw notFound('Salon not found');
-  const facilities = await one(`SELECT * FROM salon_hygiene_facilities WHERE salon_id = $1`, [salonId]);
+  const facilities = await one(
+    `SELECT h.*, u.full_name AS verified_by_admin_name
+       FROM salon_hygiene_facilities h
+       LEFT JOIN users u ON u.id = h.verified_by_admin_id
+      WHERE h.salon_id = $1`,
+    [salonId],
+  );
   const services = await query(
     `SELECT ss.*, sc.name AS category_name, sc.slug AS category_slug
        FROM salon_services ss
@@ -292,11 +367,19 @@ export async function salonProfile(salonId: string): Promise<Record<string, any>
     [salonId],
   );
 
-  return {
+  const profile = {
     ...salon,
     hygiene_facilities: facilities ?? null,
     services,
     staff,
     reviews,
   };
+
+  // Cache in Redis for 10 minutes
+  await redis.set(cacheKey, JSON.stringify(profile), 'EX', 600);
+  return profile;
+}
+
+export async function invalidateSalonProfileCache(salonId: string): Promise<void> {
+  await redis.del(`salon:profile:${salonId}`);
 }

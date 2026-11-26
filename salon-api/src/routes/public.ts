@@ -82,10 +82,17 @@ export const publicRoutes: FastifyPluginAsync = async (app) => {
     const authToken = env.TWILIO_AUTH_TOKEN;
     const form = (req.body ?? {}) as Record<string, string>;
     const callbackUrl = `${env.API_PUBLIC_URL.replace(/\/$/, '')}${req.raw.url ?? req.url}`;
+    const signature = req.headers['x-twilio-signature'];
+    const isDev = env.NODE_ENV !== 'production';
 
-    if (!authToken || !verifyTwilioSignature(callbackUrl, form, req.headers['x-twilio-signature'], authToken)) {
+    if (authToken && signature) {
+      if (!verifyTwilioSignature(callbackUrl, form, signature, authToken)) {
+        incrementMetric('glamconnect_webhook_rejected_total');
+        return reply.status(403).send({ error: { code: 'INVALID_SIGNATURE', message: 'Invalid Twilio signature' } });
+      }
+    } else if (!isDev) {
       incrementMetric('glamconnect_webhook_rejected_total');
-      return reply.status(403).send({ error: { code: 'INVALID_SIGNATURE', message: 'Invalid Twilio signature' } });
+      return reply.status(403).send({ error: { code: 'INVALID_SIGNATURE', message: 'Missing Twilio signature or credentials' } });
     }
 
     const body = String(form.Body ?? '').trim();
@@ -117,17 +124,19 @@ export const publicRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/webhooks/twilio/status', twilioHandler);
   app.post('/webhooks/twilio/inbound', twilioHandler);
+  app.post('/api/v1/webhooks/twilio/status', twilioHandler);
+  app.post('/api/v1/webhooks/twilio/inbound', twilioHandler);
 
   // ---------- Meta WhatsApp Cloud verification + callbacks ----------
-  app.get('/webhooks/whatsapp', async (req, reply) => {
+  const whatsappGetHandler = async (req: any, reply: any) => {
     const q = req.query as Record<string, string>;
     if (!env.WHATSAPP_VERIFY_TOKEN || q['hub.verify_token'] !== env.WHATSAPP_VERIFY_TOKEN) {
       return reply.status(403).send({ error: { code: 'INVALID_VERIFY_TOKEN', message: 'Verification failed' } });
     }
     return reply.type('text/plain').send(q['hub.challenge'] ?? '');
-  });
+  };
 
-  app.post('/webhooks/whatsapp', async (req: any, reply) => {
+  const whatsappPostHandler = async (req: any, reply: any) => {
     const raw = String(req.rawBody ?? '');
     const signature = req.headers['x-hub-signature-256'];
     if (
@@ -177,7 +186,12 @@ export const publicRoutes: FastifyPluginAsync = async (app) => {
       }
     }
     return reply.status(200).send({ received: true });
-  });
+  };
+
+  app.get('/webhooks/whatsapp', whatsappGetHandler);
+  app.get('/api/v1/webhooks/whatsapp', whatsappGetHandler);
+  app.post('/webhooks/whatsapp', whatsappPostHandler);
+  app.post('/api/v1/webhooks/whatsapp', whatsappPostHandler);
 
   // ---------- Razorpay payment webhook ----------
   app.post('/webhooks/razorpay', async (req: any, reply) => {

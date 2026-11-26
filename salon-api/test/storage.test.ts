@@ -121,6 +121,36 @@ test('presignPut signs the declared content type so it cannot be swapped', () =>
   );
 });
 
+test('presignGet generates 60s SigV4 GET URL for private reference photos', () => {
+  withS3(
+    {
+      S3_BUCKET: 'glam-test',
+      S3_ACCESS_KEY_ID: 'AKIATEST',
+      S3_SECRET_ACCESS_KEY: 'secret',
+      S3_ENDPOINT: 'http://127.0.0.1:9000',
+      S3_FORCE_PATH_STYLE: 'true',
+      S3_PUBLIC_BASE_URL: undefined,
+      S3_REGION: 'ap-south-1',
+    },
+    () => {
+      const result = presignGet({ key: 'style-vault/u1/cut.jpg', expiresSec: 60 });
+      assert.equal(result.expires_in, 60);
+      assert.equal(result.key, 'style-vault/u1/cut.jpg');
+      assert.match(result.url, /^http:\/\/127\.0\.0\.1:9000\/glam-test\/style-vault\/u1\/cut\.jpg\?/);
+      assert.match(result.url, /X-Amz-Expires=60/);
+      assert.match(result.url, /X-Amz-SignedHeaders=host/);
+      assert.match(result.url, /X-Amz-Signature=[0-9a-f]{64}$/);
+    },
+  );
+});
+
+test('presignGet falls back gracefully when storage is unconfigured', () => {
+  withS3({ S3_BUCKET: undefined, S3_ACCESS_KEY_ID: undefined, S3_SECRET_ACCESS_KEY: undefined }, () => {
+    const result = presignGet({ key: 'style-vault/u1/cut.jpg' });
+    assert.equal(result.url, '/uploads/mock/style-vault/u1/cut.jpg');
+  });
+});
+
 test('maxBytesFor enforces per-type limits', () => {
   assert.equal(maxBytesFor('image/png'), 5 * 1024 * 1024);
   assert.equal(maxBytesFor('application/pdf'), 10 * 1024 * 1024);

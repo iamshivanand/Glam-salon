@@ -6,6 +6,7 @@ import {
   fetchKycDocumentUrl,
   rupees,
   useAdminAudit,
+  useAdminDisputes,
   useAdminKyc,
   useAdminSalons,
   useAdminStats,
@@ -15,6 +16,7 @@ import {
   useSetSalonStatus,
   useUpdateAdminUser,
   useUpdateCommission,
+  useUpdateDispute,
 } from '@/lib/api';
 import { useAuth, useAuthModal } from '@/lib/store';
 
@@ -38,6 +40,9 @@ export default function PlatformPage() {
   const users = useAdminUsers(isAdmin);
   const review = useReviewKyc();
   const commission = useUpdateCommission();
+  const [disputeFilter, setDisputeFilter] = useState<'OPEN_ALERT' | 'ESCALATED' | 'RESOLVED' | 'ALL'>('OPEN_ALERT');
+  const disputes = useAdminDisputes(disputeFilter, isAdmin);
+  const updateDispute = useUpdateDispute();
   const salonStatus = useSetSalonStatus();
   const adminUser = useUpdateAdminUser();
   const payout = useRecordPayout();
@@ -92,6 +97,17 @@ export default function PlatformPage() {
     try {
       await commission.mutateAsync({ salonId, marketplace_new_client_bps: bps });
       setNotice('Commission updated.');
+    } catch (err: any) {
+      setProblem(err.message);
+    }
+  };
+
+  const handleUpdateDispute = async (id: string, resolution_status: string) => {
+    setNotice(null);
+    setProblem(null);
+    try {
+      await updateDispute.mutateAsync({ id, resolution_status });
+      setNotice(`Dispute status updated to ${resolution_status.toLowerCase().replaceAll('_', ' ')}.`);
     } catch (err: any) {
       setProblem(err.message);
     }
@@ -244,6 +260,121 @@ export default function PlatformPage() {
           </tbody>
         </table>
         {!kyc.data?.submissions.length && <p className="p-6 text-sm opacity-60">No KYC submissions.</p>}
+      </section>
+
+      {/* Escalated Complaints & Disputes (Ticket 15 - F1.15 - API-38) */}
+      <section className="card overflow-x-auto">
+        <div className="p-5 pb-0 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-semibold flex items-center gap-2">
+              <span>⚠️</span> Escalated Complaints & Disputes (API-38)
+            </h2>
+            <p className="text-xs opacity-60 mt-1">
+              Low-rating customer reviews (≤ 2 stars) and partner escalations across salons.
+            </p>
+          </div>
+          <div className="flex gap-1 bg-surface-raised/40 p-0.5 rounded-lg border border-line text-xs">
+            {(['OPEN_ALERT', 'ESCALATED', 'RESOLVED', 'ALL'] as const).map((st) => (
+              <button
+                key={st}
+                onClick={() => setDisputeFilter(st)}
+                className={`px-2.5 py-0.5 rounded-md transition ${disputeFilter === st ? 'bg-accent text-[#2D1B2E] font-medium' : 'opacity-60 hover:opacity-100'}`}
+              >
+                {st === 'OPEN_ALERT' ? 'Open Alerts' : st === 'ESCALATED' ? 'Escalated' : st === 'RESOLVED' ? 'Resolved' : 'All'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <table className="w-full text-sm min-w-[950px] mt-3">
+          <thead>
+            <tr className="text-left opacity-60">
+              <th className="p-3">Booking / Date</th>
+              <th>Customer</th>
+              <th>Salon / Stylist</th>
+              <th>Ratings</th>
+              <th>AI Tags</th>
+              <th>Feedback</th>
+              <th>Status / Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(disputes.data?.disputes ?? []).map((d) => (
+              <tr key={d.id} className="border-t border-line align-top text-xs">
+                <td className="p-3 font-medium whitespace-nowrap">
+                  <div>#{d.booking_code}</div>
+                  <div className="opacity-50 text-[11px]">{new Date(d.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}</div>
+                </td>
+                <td>
+                  <span className="font-medium">{d.customer_name}</span>
+                </td>
+                <td>
+                  <div><b>{d.salon_name}</b></div>
+                  <div className="opacity-50 text-[11px]">{d.salon_locality} · Stylist: {d.staff_name ?? '—'}</div>
+                </td>
+                <td className="whitespace-nowrap">
+                  <div className="font-semibold text-amber-500">★ {d.overall_rating}/5</div>
+                  <div className="text-[11px] opacity-60">Hygiene: {d.hygiene_rating}/5</div>
+                </td>
+                <td>
+                  <div className="flex flex-wrap gap-1 max-w-[160px]">
+                    {d.ai_complaint_tags?.length ? (
+                      d.ai_complaint_tags.map((tag) => (
+                        <span key={tag} className="text-[9px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20 font-medium">
+                          {tag}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="opacity-40 text-[11px]">None</span>
+                    )}
+                  </div>
+                </td>
+                <td className="max-w-[240px]">
+                  <p className="italic opacity-80 line-clamp-3" title={d.review_text ?? ''}>{d.review_text || 'No text review'}</p>
+                  {d.owner_reply && (
+                    <p className="mt-1 text-[11px] bg-white/5 p-1.5 rounded-lg border border-line/40">
+                      <b className="opacity-60 block">Owner reply:</b> {d.owner_reply}
+                    </p>
+                  )}
+                </td>
+                <td className="p-2 whitespace-nowrap">
+                  <span className={`chip !py-0.5 !px-2 mb-2 inline-block ${
+                    d.resolution_status === 'OPEN_ALERT'
+                      ? '!bg-amber-100 !text-amber-800 !border-amber-300'
+                      : d.resolution_status === 'ESCALATED'
+                      ? '!bg-red-100 !text-red-800 !border-red-300'
+                      : '!bg-green-100 !text-green-800 !border-green-300'
+                  }`}>
+                    {d.resolution_status}
+                  </span>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {d.resolution_status !== 'RESOLVED' && (
+                      <button
+                        onClick={() => handleUpdateDispute(d.id, 'RESOLVED')}
+                        disabled={updateDispute.isPending}
+                        className="text-[10px] px-2 py-0.5 rounded-md bg-emerald-600 text-white font-medium hover:bg-emerald-700"
+                      >
+                        Resolve
+                      </button>
+                    )}
+                    {d.resolution_status !== 'ESCALATED' && (
+                      <button
+                        onClick={() => handleUpdateDispute(d.id, 'ESCALATED')}
+                        disabled={updateDispute.isPending}
+                        className="text-[10px] px-2 py-0.5 rounded-md border border-red-400 text-red-400 hover:bg-red-500/10"
+                      >
+                        Escalate
+                      </button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!disputes.isLoading && (!disputes.data?.disputes || disputes.data.disputes.length === 0) && (
+          <p className="p-6 text-sm opacity-60 text-center">No escalated complaints in this status.</p>
+        )}
       </section>
 
       <section className="card overflow-x-auto">

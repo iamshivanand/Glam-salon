@@ -14,7 +14,9 @@ export type TransactionalTemplate =
   | 'QUEUE_JOINED'
   | 'QUEUE_CALLED'
   | 'PAYMENT_RECEIPT'
-  | 'PAYMENT_REFUNDED';
+  | 'PAYMENT_REFUNDED'
+  | 'KYC_APPROVED'
+  | 'KYC_REJECTED';
 
 export interface TemplateContext {
   customerName: string;
@@ -105,6 +107,18 @@ export function renderTransactional(
         subject: `Refund processed — ${ctx.salonName}`,
         text: `Hi ${name}, a refund of ₹${ctx.amountInr ?? '0'} for ${ctx.salonName}${code} has been processed. It may take 5–7 working days to appear.`,
         params: [name, ctx.salonName, ctx.amountInr ?? '0', ctx.bookingCode ?? ''],
+      };
+    case 'KYC_APPROVED':
+      return {
+        subject: `Salon verification approved — ${ctx.salonName}`,
+        text: `Hi ${name}, congratulations! Your salon ${ctx.salonName} has been verified and approved on Glam Connect. Your listing is now active on the marketplace.`,
+        params: [name, ctx.salonName],
+      };
+    case 'KYC_REJECTED':
+      return {
+        subject: `Salon verification update — ${ctx.salonName}`,
+        text: `Hi ${name}, your verification application for ${ctx.salonName} was not approved.${ctx.reason ? ` Reason: ${ctx.reason}.` : ''} Please update your KYC details in the partner portal to resubmit.`,
+        params: [name, ctx.salonName, ctx.reason ?? ''],
       };
   }
 }

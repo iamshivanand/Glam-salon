@@ -191,13 +191,22 @@ export function presignPut(opts: {
   };
 }
 
-/** Short-lived read URL. KYC documents are private, so the API signs GETs. */
-export function presignGet(key: string, expiresSec = 300): {
-  url: string;
-  expires_in: number;
-} {
-  const { url, expiresIn } = presign({ method: 'GET', key, expiresSec });
-  return { url, expires_in: expiresIn };
+/** Short-lived read URL. Supports string key or options object. */
+export function presignGet(
+  keyOrOpts: string | { key: string; expiresSec?: number },
+  expiresSec = 300,
+): { url: string; key: string; expires_in: number } {
+  const key = typeof keyOrOpts === 'string' ? keyOrOpts : keyOrOpts.key;
+  const exp = typeof keyOrOpts === 'object' && keyOrOpts.expiresSec !== undefined ? keyOrOpts.expiresSec : expiresSec;
+  if (!storageConfigured()) {
+    return {
+      url: publicUrlFor(key) ?? `/uploads/mock/${key.replace(/^\/+/, '')}`,
+      key,
+      expires_in: exp,
+    };
+  }
+  const { url, expiresIn } = presign({ method: 'GET', key, expiresSec: exp });
+  return { url, key, expires_in: expiresIn };
 }
 
 function signedRequest(method: 'HEAD' | 'DELETE', key: string): { url: string; headers: Record<string, string> } {
@@ -269,3 +278,5 @@ export function publicUrlFor(key: string): string | null {
   if (!env.S3_PUBLIC_BASE_URL) return null;
   return `${env.S3_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key.replace(/^\/+/, '')}`;
 }
+
+

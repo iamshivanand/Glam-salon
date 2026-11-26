@@ -4,6 +4,7 @@ import { badRequest, conflict, notFound } from '../http.js';
 import { loadServices } from './availability.js';
 import { fmtLocalDate } from './availability.js';
 import { queueTransactional } from './transactional.js';
+import { redis } from '../redis.js';
 
 const AVG_SERVICE_MINS = 15;
 
@@ -76,6 +77,16 @@ export async function joinQueue(opts: {
       is_estimate_disclaimer: true,
     };
   });
+
+  const seqKey = `queue:seq:${opts.salonId}:${queueDate}`;
+  await redis.set(seqKey, String(result.token_number), 'EX', 86400 * 2).catch(() => {});
+  await redis.zadd(`queue:active:${opts.salonId}`, result.token_number, result.token_id).catch(() => {});
+  await redis.expire(`queue:active:${opts.salonId}`, 86400 * 2).catch(() => {});
+
+  // Broadcast live queue snapshot over Redis Pub/Sub
+  void liveQueue(opts.salonId).then((snapshot) => {
+    return redis.publish(`pubsub:queue:${opts.salonId}`, JSON.stringify(snapshot));
+  }).catch(() => {});
 
   if (opts.customerId) {
     queueTransactional({
@@ -171,6 +182,17 @@ export async function updateQueueStatus(opts: {
     return client.query(`SELECT * FROM walkin_queue_tokens WHERE id = $1`, [opts.tokenId]).then((r) => r.rows[0]);
   });
 
+  if (['COMPLETED', 'SKIPPED', 'LEFT_QUEUE'].includes(opts.status)) {
+    await redis.zrem(`queue:active:${opts.salonId}`, opts.tokenId).catch(() => {});
+  } else if (updated) {
+    await redis.zadd(`queue:active:${opts.salonId}`, updated.token_number, opts.tokenId).catch(() => {});
+  }
+
+  // Broadcast live queue snapshot over Redis Pub/Sub
+  void liveQueue(opts.salonId).then((snapshot) => {
+    return redis.publish(`pubsub:queue:${opts.salonId}`, JSON.stringify(snapshot));
+  }).catch(() => {});
+
   if (opts.status === 'CALLED' && updated?.customer_id) {
     const salon = await one<{ name: string }>(`SELECT name FROM salons WHERE id = $1`, [opts.salonId]);
     queueTransactional({
@@ -186,4 +208,39 @@ export async function updateQueueStatus(opts: {
     });
   }
   return updated;
+}
+
+export async function getTokenStatus(salonId: string, tokenId: string) {
+  const token = await one<any>(
+    `SELECT * FROM walkin_queue_tokens WHERE id = $1 AND salon_id = $2`,
+    [tokenId, salonId],
+  );
+  if (!token) throw notFound('Queue token not found');
+
+  let peopleAhead = 0;
+  if (token.status === 'WAITING') {
+    const aheadResult = await one<{ count: string }>(
+      `SELECT COUNT(*)::int AS count FROM walkin_queue_tokens
+        WHERE salon_id = $1 AND queue_date = $2 AND status = 'WAITING' AND token_number < $3`,
+      [salonId, token.queue_date, token.token_number],
+    );
+    peopleAhead = Number(aheadResult?.count ?? 0);
+  }
+
+  return {
+    token_id: token.id,
+    token_number: token.token_number,
+    status: token.status,
+    customer_name: token.walkin_customer_name,
+    queue_date: token.queue_date,
+    people_ahead: peopleAhead,
+    estimated_wait_mins: token.status === 'IN_SERVICE' ? 0 : token.estimated_wait_mins,
+    assigned_staff_id: token.assigned_staff_id,
+    assigned_resource_id: token.assigned_resource_id,
+    total_duration_mins: token.total_duration_mins,
+    joined_at: token.joined_at,
+    called_at: token.called_at,
+    service_started_at: token.service_started_at,
+    completed_at: token.completed_at,
+  };
 }

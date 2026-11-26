@@ -7,6 +7,7 @@ import {
   cancelBooking,
   createBooking,
   createReview,
+  expireStaleBookings,
   getBookingForActor,
   holdBooking,
   rescheduleBooking,
@@ -58,8 +59,13 @@ function idempotencyKey(req: any): string {
 }
 
 async function bookingDetail(bookingId: string) {
-  const booking = await one(`SELECT * FROM bookings WHERE id = $1`, [bookingId]);
+  let booking = await one(`SELECT * FROM bookings WHERE id = $1`, [bookingId]);
   if (!booking) throw notFound('Booking not found');
+  if (booking.status === 'REQUESTED' && booking.approval_expires_at && new Date(booking.approval_expires_at).getTime() < Date.now()) {
+    await expireStaleBookings().catch(() => {});
+    booking = await one(`SELECT * FROM bookings WHERE id = $1`, [bookingId]);
+    if (!booking) throw notFound('Booking not found');
+  }
   const items = await query(
     `SELECT bi.*, sm.display_name AS staff_name
        FROM booking_items bi
@@ -111,16 +117,30 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
 
   app.get('/bookings', { preHandler: [authenticate] }, async (req) => {
     const q = req.query as Record<string, string>;
+    const params: unknown[] = [req.auth!.id];
+    let statusFilter = '';
+    if (q.status) {
+      params.push(q.status);
+      statusFilter = ` AND b.status = $${params.length}::booking_status`;
+    }
     const rows = await query(
       `SELECT b.*, s.name AS salon_name, s.locality, s.city,
-              (SELECT r.id FROM reviews r WHERE r.booking_id = b.id) AS review_id
+              (SELECT r.id FROM reviews r WHERE r.booking_id = b.id LIMIT 1) AS review_id,
+              (SELECT COALESCE(json_agg(json_build_object(
+                 'id', bi.id,
+                 'service_name', bi.service_name_snapshot,
+                 'status', bi.status,
+                 'unit_price_paise', bi.unit_price_paise
+               )), '[]'::json)
+               FROM booking_items bi
+               WHERE bi.booking_id = b.id
+              ) AS items
          FROM bookings b
          JOIN salons s ON s.id = b.salon_id
-        WHERE b.customer_id = $1
-          AND ($2::text IS NULL OR b.status::text = $2)
+        WHERE b.customer_id = $1${statusFilter}
         ORDER BY b.scheduled_start_at DESC
         LIMIT 100`,
-      [req.auth!.id, q.status ?? null],
+      params,
     );
     return { bookings: rows };
   });
@@ -131,7 +151,7 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
     return bookingDetail(id);
   });
 
-  app.post('/bookings/:id/reschedule', { preHandler: [authenticate] }, async (req) => {
+  const handleReschedule = async (req: any) => {
     const { id } = req.params as { id: string };
     const body = parse(RescheduleInput, req.body);
     return rescheduleBooking({
@@ -140,7 +160,10 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
       newStartAt: body.new_start_at,
       staffId: body.staff_id,
     });
-  });
+  };
+
+  app.post('/bookings/:id/reschedule', { preHandler: [authenticate] }, handleReschedule);
+  app.patch('/bookings/:id/reschedule', { preHandler: [authenticate] }, handleReschedule);
 
   app.post('/bookings/:id/cancel', { preHandler: [authenticate] }, async (req) => {
     const { id } = req.params as { id: string };

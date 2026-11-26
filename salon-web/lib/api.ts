@@ -168,6 +168,7 @@ export const qk = {
   categories: ['categories'] as const,
   availability: (salonId?: string, services?: string[], date?: string, staff?: string) =>
     ['availability', salonId, services?.join(','), date, staff] as const,
+  addons: (salonId?: string, primary?: string, staff?: string) => ['addons', salonId, primary, staff] as const,
   myBookings: ['my-bookings'] as const,
   dashboard: (period: string) => ['partner', 'dashboard', period] as const,
   partnerBookings: (date: string) => ['partner', 'bookings', date] as const,
@@ -280,11 +281,19 @@ export interface MyBooking {
   scheduled_start_at: string;
   scheduled_end_at: string;
   total_payable_paise: number;
+  subtotal_paise?: number;
+  tax_paise?: number;
   salon_name: string;
   locality: string;
   city: string;
   checkin_pin?: string;
   review_id?: string | null;
+  items?: {
+    id: string;
+    service_name: string;
+    status: string;
+    unit_price_paise: number;
+  }[];
 }
 
 export interface PartnerBooking {
@@ -297,6 +306,8 @@ export interface PartnerBooking {
   checkin_pin: string;
   customer_name: string;
   customer_notes: string | null;
+  is_prepaid?: boolean;
+  prepaid_payment_id?: string | null;
   items: {
     id: string;
     service_name: string;
@@ -347,6 +358,36 @@ export function useSalonSearch(params: { lat?: number; lng?: number; radius_km?:
   return useQuery({
     queryKey: qk.salons(params),
     queryFn: () => api<SearchResponse>(`/discovery/search${qs({ ...params, page_size: 12 })}`),
+    staleTime: 60_000,
+  });
+}
+
+export interface UrgentSlotMatch {
+  salon_id: string;
+  salon_name: string;
+  distance_km: number | null;
+  travel_eta_mins: number;
+  earliest_slot_start: string;
+  starts_in_mins: number;
+  staff_id: string;
+  staff_name: string | null;
+  price_paise: number;
+  flash_deal_discount_paise: number;
+  instant_confirm_guaranteed: boolean;
+}
+
+export function useUrgentSlots(params: {
+  lat?: number;
+  lng?: number;
+  radius_km?: number;
+  category_id?: string;
+  within_mins?: number;
+}) {
+  return useQuery({
+    queryKey: ['urgent-slots', params],
+    queryFn: () => api<{ urgent_matches: UrgentSlotMatch[] }>(`/discovery/urgent-slots${qs(params)}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
   });
 }
 
@@ -355,6 +396,7 @@ export function useSalon(id?: string) {
     queryKey: qk.salon(id),
     queryFn: () => api<SalonProfile>(`/salons/${id}`),
     enabled: !!id,
+    staleTime: 60_000,
   });
 }
 
@@ -366,6 +408,38 @@ export function useCategories() {
   });
 }
 
+export interface SalonComparisonItem {
+  salon_id: string;
+  salon_name: string;
+  service_name: string | null;
+  price_paise: number | null;
+  pricing_model: 'FIXED' | 'STARTING_FROM_QUOTE' | null;
+  duration_mins: number | null;
+  facilities: {
+    has_private_room: boolean;
+    uses_disposable_kits: boolean;
+    autoclave_sterilization: boolean;
+    wheelchair_accessible: boolean;
+    has_women_only_zone: boolean;
+    verified_by_admin_name?: string | null;
+    verified_at?: string | null;
+  } | null;
+  next_slot: string | null;
+  queue_wait_mins: number;
+  queue_waiting_count?: number;
+}
+
+export function useCompareSalons(salonIds: string[], categoryId?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['compare', salonIds.join(','), categoryId],
+    queryFn: () =>
+      api<{ category: string; comparison: SalonComparisonItem[] }>(
+        `/discovery/compare${qs({ salon_ids: salonIds.join(','), category_id: categoryId })}`,
+      ),
+    enabled: enabled && salonIds.length >= 2 && !!categoryId,
+  });
+}
+
 export function useAvailability(salonId?: string, serviceIds: string[] = [], date?: string, staffId?: string) {
   return useQuery({
     queryKey: qk.availability(salonId, serviceIds, date, staffId),
@@ -374,6 +448,35 @@ export function useAvailability(salonId?: string, serviceIds: string[] = [], dat
         `/salons/${salonId}/availability${qs({ service_ids: serviceIds.join(','), date, staff_id: staffId })}`,
       ),
     enabled: !!salonId && serviceIds.length > 0 && !!date,
+  });
+}
+
+export interface AddonRecommendation {
+  addon_mapping_id: string;
+  primary_service_id: string;
+  addon_service_id: string;
+  bundle_discount_paise: number;
+  priority_rank: number;
+  service_id: string;
+  name: string;
+  description: string | null;
+  base_price_paise: number;
+  discounted_price_paise: number | null;
+  bundle_price_paise: number;
+  duration_mins: number;
+  buffer_after_mins: number;
+  category_name: string;
+}
+
+export function useAddonRecommendations(salonId?: string, serviceIds?: string | string[], staffId?: string) {
+  const serviceIdsStr = Array.isArray(serviceIds) ? serviceIds.filter(Boolean).join(',') : (serviceIds ?? '');
+  return useQuery({
+    queryKey: qk.addons(salonId, serviceIdsStr, staffId),
+    queryFn: () =>
+      api<{ addons: AddonRecommendation[] }>(
+        `/salons/${salonId}/addons/recommend${qs({ service_ids: serviceIdsStr, staff_id: staffId })}`,
+      ),
+    enabled: !!salonId,
   });
 }
 
@@ -398,7 +501,7 @@ export function useHold() {
 export function useCreateBooking() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: { hold_token: string; customer_notes?: string; reminder_token?: string }) =>
+    mutationFn: (body: { hold_token: string; customer_notes?: string; reminder_token?: string; payment_mode?: string }) =>
       api<{ id: string; booking_code: string; status: string; checkin_pin: string; scheduled_start_at: string; total_payable_paise: number }>(
         '/bookings',
         { method: 'POST', body, key: crypto.randomUUID() },
@@ -412,8 +515,13 @@ export function useCreateBooking() {
 export function useCancelBooking() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
-      api(`/bookings/${id}/cancel`, { method: 'POST', body: { reason } }),
+    mutationFn: ({ id, reason, cancel_item_ids }: { id: string; reason?: string; cancel_item_ids?: string[] }) =>
+      api<{
+        status: string;
+        cancellation_fee_paise: number;
+        refund_due_paise: number;
+        refunded_paise?: number;
+      }>(`/bookings/${id}/cancel`, { method: 'POST', body: { reason, cancel_item_ids } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.myBookings }),
   });
 }
@@ -470,6 +578,8 @@ export interface CrmCustomer {
   customer_name: string;
   custom_customer_code: string;
   preferred_staff_id: string | null;
+  preferred_staff_name?: string | null;
+  preferred_service_ids?: string[];
   total_visits: number;
   total_spend_paise: number;
   avg_bill_paise: number;
@@ -478,6 +588,10 @@ export interface CrmCustomer {
   last_visit_at: string;
   next_expected_visit_date: string | null;
   loyalty_points_balance: number;
+  style_preferences_json?: Record<string, any>;
+  reference_photo_s3_keys?: string[];
+  reference_photos?: { key: string; url: string; expires_in: number }[];
+  photo_consent_granted?: boolean;
 }
 
 export function usePartnerCrm(enabled = true) {
@@ -517,6 +631,98 @@ export function useUpdateCrm() {
       qc.invalidateQueries({ queryKey: qk.partnerCrm });
       qc.invalidateQueries({ queryKey: qk.partnerCrmDetail(vars.customerId) });
     },
+  });
+}
+
+export function useUpdateStyleVault() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      customerId,
+      ...body
+    }: {
+      customerId: string;
+      preferred_staff_id?: string | null;
+      preferred_service_ids?: string[];
+      style_preferences?: Record<string, any>;
+      request_photo_upload_count?: number;
+      uploaded_photo_keys?: string[];
+    }) =>
+      api<{
+        style_vault: CrmCustomer;
+        upload_urls: { upload_url: string; method: string; key: string; expires_in: number }[];
+      }>(`/partner/crm/${customerId}/style-vault`, { method: 'PUT', body }),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.partnerCrm });
+      qc.invalidateQueries({ queryKey: qk.partnerCrmDetail(vars.customerId) });
+    },
+  });
+}
+
+export interface CustomerStyleVaultItem {
+  salon_id: string;
+  salon_name: string;
+  locality: string;
+  preferred_staff_id: string | null;
+  preferred_staff_name: string | null;
+  style_preferences_json: Record<string, any>;
+  reference_photos: { key: string; url: string }[];
+  last_visit_at: string;
+  total_visits: number;
+  photo_consent_granted: boolean;
+}
+
+export function useCustomerStyleVault(enabled = true) {
+  return useQuery({
+    queryKey: ['users', 'style-vault'],
+    queryFn: () => api<{ vaults: CustomerStyleVaultItem[]; photo_consent_granted: boolean }>('/users/me/style-vault'),
+    enabled,
+  });
+}
+
+export interface CustomerLoyaltyPassbook {
+  total_points: number;
+  total_wallet_paise: number;
+  total_promo_paise: number;
+  balances: {
+    salon_id: string;
+    salon_name: string;
+    locality: string;
+    loyalty_points_balance: number;
+    prepaid_purchased_balance_paise: number;
+    prepaid_promo_balance_paise: number;
+    total_visits: number;
+    last_visit_at: string;
+  }[];
+  entries: {
+    id: string;
+    salon_id: string;
+    salon_name: string;
+    locality: string;
+    invoice_id: string | null;
+    invoice_number: string | null;
+    bucket: 'LOYALTY_POINTS' | 'PURCHASED_WALLET_PAISE' | 'PROMO_CREDIT_PAISE';
+    entry_type:
+      | 'EARN_VISIT'
+      | 'REDEEM_CHECKOUT'
+      | 'WALLET_TOPUP'
+      | 'PROMO_BONUS'
+      | 'REFERRAL_REWARD'
+      | 'REFUND_REVERSAL'
+      | 'EXPIRED';
+    amount_delta: number;
+    balance_after: number;
+    notes: string | null;
+    created_at: string;
+  }[];
+}
+
+export function useCustomerLoyaltyLedger(enabled = true, bucket?: string) {
+  return useQuery({
+    queryKey: ['users', 'loyalty-ledger', bucket ?? 'ALL'],
+    queryFn: () =>
+      api<CustomerLoyaltyPassbook>(`/users/me/loyalty-ledger${bucket ? `?bucket=${bucket}` : ''}`),
+    enabled,
   });
 }
 
@@ -636,6 +842,88 @@ export function usePartnerQueue(enabled = true) {
   });
 }
 
+export function useLiveQueue(salonId: string, enabled = true) {
+  return useQuery({
+    queryKey: ['queue', 'live', salonId],
+    queryFn: () =>
+      api<{
+        walkin_paused: boolean;
+        now_serving_token: number | null;
+        waiting_count: number;
+        queue: {
+          token_number: number;
+          customer_name: string;
+          status: string;
+          estimated_wait_mins: number;
+        }[];
+      }>(`/queue/${salonId}/live`),
+    enabled: enabled && !!salonId,
+    refetchInterval: 10_000,
+  });
+}
+
+export function useQueueToken(salonId: string, tokenId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ['queue', 'token', salonId, tokenId],
+    queryFn: () =>
+      api<{
+        token_id: string;
+        token_number: number;
+        status: string;
+        customer_name: string;
+        queue_date: string;
+        people_ahead: number;
+        estimated_wait_mins: number;
+        assigned_staff_id?: string;
+        assigned_resource_id?: string;
+        total_duration_mins: number;
+        joined_at: string;
+        called_at?: string;
+        service_started_at?: string;
+        completed_at?: string;
+      }>(`/queue/${salonId}/tokens/${tokenId}`),
+    enabled: enabled && !!salonId && !!tokenId,
+    refetchInterval: 5_000,
+  });
+}
+
+export function useJoinQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      salon_id: string;
+      customer_name?: string;
+      phone?: string;
+      service_ids: string[];
+      preferred_staff_id?: string;
+    }) =>
+      api<{
+        token_id: string;
+        token_number: number;
+        status: string;
+        people_ahead: number;
+        estimated_wait_mins: number;
+        is_estimate_disclaimer?: boolean;
+      }>('/queue/join', { method: 'POST', body }),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['queue', 'live', vars.salon_id] });
+      qc.invalidateQueries({ queryKey: ['salons'] });
+    },
+  });
+}
+
+export function useLeaveQueue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ salonId, tokenId }: { salonId: string; tokenId: string }) =>
+      api(`/queue/${salonId}/tokens/${tokenId}`, { method: 'PATCH', body: { status: 'LEFT_QUEUE' } }),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['queue', 'live', vars.salonId] });
+      qc.invalidateQueries({ queryKey: ['queue', 'token', vars.salonId, vars.tokenId] });
+    },
+  });
+}
+
 export function usePartnerInvoices(enabled = true) {
   return useQuery({
     queryKey: qk.partnerInvoices,
@@ -684,11 +972,25 @@ export function useUpdateStaffBookingStatus() {
 export function useCreateInvoice() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ bookingId, method }: { bookingId: string; method: string }) =>
-      api<{ invoice_number: string; net_collected_paise: number }>('/partner/invoices', {
+    mutationFn: (body: {
+      bookingId?: string;
+      walkinTokenId?: string;
+      method?: string;
+      discount_paise?: number;
+      redeem_loyalty_points?: number;
+      split_payments?: { method: string; amount_paise: number }[];
+    }) =>
+      api<{ invoice_number: string; net_collected_paise: number; method: string }>('/partner/invoices', {
         method: 'POST',
         key: crypto.randomUUID(),
-        body: { booking_id: bookingId, method },
+        body: {
+          booking_id: body.bookingId,
+          walkin_token_id: body.walkinTokenId,
+          method: body.method ?? (body.split_payments?.length ? 'SPLIT' : 'CASH'),
+          discount_paise: body.discount_paise,
+          redeem_loyalty_points: body.redeem_loyalty_points,
+          split_payments: body.split_payments,
+        },
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['partner'] }),
   });
@@ -741,6 +1043,33 @@ export function useSetSchedule() {
     mutationFn: ({ staffId, entries }: { staffId: string; entries: unknown[] }) =>
       api(`/partner/staff/${staffId}/schedule`, { method: 'POST', body: { entries } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.partnerStaff }),
+  });
+}
+
+export function useAddStaffBreak() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      staffId,
+      date,
+      start_time,
+      end_time,
+      reason,
+    }: {
+      staffId: string;
+      date: string;
+      start_time: string;
+      end_time: string;
+      reason?: string;
+    }) =>
+      api<{ ok: boolean; staff_id: string; date: string; break: { start: string; end: string; reason: string } }>(
+        `/partner/staff/${staffId}/breaks`,
+        { method: 'POST', body: { date, start_time, end_time, reason } },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.partnerStaff });
+      qc.invalidateQueries({ queryKey: ['availability'] });
+    },
   });
 }
 
@@ -1151,6 +1480,17 @@ export function useDeleteAddress() {
   });
 }
 
+export function useUpdateAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string } & Partial<Omit<Address, 'id'>>) =>
+      api(`/users/me/addresses/${id}`, { method: 'PATCH', body }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me', 'addresses'] }),
+  });
+}
+
+
+
 export function useSetAvatar() {
   const qc = useQueryClient();
   return useMutation({
@@ -1348,4 +1688,51 @@ export function useAdminAudit(enabled = true) {
 export async function fetchKycDocumentUrl(salonId: string): Promise<string> {
   const res = await api<{ url: string; expires_in: number }>(`/admin/kyc/${salonId}/document`);
   return res.url;
+}
+
+// ------------------------------------------------------------------ admin disputes (API-38)
+export interface AdminDispute {
+  id: string;
+  booking_id: string;
+  booking_code: string;
+  salon_id: string;
+  salon_name: string;
+  salon_locality: string;
+  salon_city: string;
+  customer_id: string;
+  customer_name: string;
+  staff_id: string | null;
+  staff_name: string | null;
+  overall_rating: number;
+  hygiene_rating: number;
+  review_text: string | null;
+  ai_complaint_tags: string[];
+  owner_reply: string | null;
+  resolution_status: 'OPEN_ALERT' | 'ESCALATED' | 'RESOLVED' | 'NONE';
+  created_at: string;
+}
+
+export function useAdminDisputes(status?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['admin', 'disputes', status ?? 'active'],
+    queryFn: () =>
+      api<{ disputes: AdminDispute[] }>(`/admin/disputes${status ? `?status=${status}` : ''}`),
+    enabled,
+  });
+}
+
+export function useUpdateDispute() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      resolution_status,
+      owner_reply,
+    }: {
+      id: string;
+      resolution_status: string;
+      owner_reply?: string;
+    }) => api(`/admin/disputes/${id}`, { method: 'PATCH', body: { resolution_status, owner_reply } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin', 'disputes'] }),
+  });
 }

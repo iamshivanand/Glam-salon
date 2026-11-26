@@ -1,11 +1,13 @@
 'use client';
 
+import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useSalon, useSalonSearch } from '@/lib/api';
+import { useSalon, useSalonSearch, useUrgentSlots } from '@/lib/api';
 import { useBooking } from '@/lib/store';
 import { salonImages, serviceImage, staffImage } from '@/lib/images';
 import { rupees } from '@/lib/api';
+import { WalkInQueueModal } from '@/components/walk-in-queue-modal';
 
 const BADGE_LABEL: Record<string, string> = {
   PRIVATE_ROOM: 'Private rooms',
@@ -34,9 +36,17 @@ function BookSalonButton({ salonId, children, className }: { salonId: string; ch
 
 export default function Home() {
   const { data: search, isLoading } = useSalonSearch({ lat: 12.9719, lng: 77.6412, radius_km: 15, sort: 'distance' });
+  const { data: urgentData, isLoading: isUrgentLoading } = useUrgentSlots({
+    lat: 12.9719,
+    lng: 77.6412,
+    radius_km: 15,
+    within_mins: 120,
+  });
+  const urgentMatches = urgentData?.urgent_matches ?? [];
   const salons = search?.salons ?? [];
   const primary = salons[0];
   const { data: profile } = useSalon(primary?.id);
+  const [queueSalon, setQueueSalon] = useState<{ id: string; name: string; locality?: string } | null>(null);
 
   return (
     <div className="space-y-12 pt-8">
@@ -78,6 +88,62 @@ export default function Home() {
         <img src={salonImages[0]} alt="Glam Connect salon" className="h-72 md:h-full object-cover" />
       </section>
 
+      {/* Urgent Slots Radar (< 2 hours) */}
+      <section id="urgent-radar" className="card p-6 border border-accent/30 bg-surface">
+        <div className="flex items-center justify-between flex-wrap gap-4 mb-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-accent"></span>
+              </span>
+              <h2 className="font-display text-2xl font-semibold">Live Urgent Slots (&lt; 2 Hours)</h2>
+            </div>
+            <p className="text-xs opacity-70 mt-1">In a rush? Discover salons near you with immediate openings right now.</p>
+          </div>
+          <span className="text-xs px-3 py-1 rounded-full bg-accent/20 text-accent font-semibold tracking-wide uppercase">
+            {urgentMatches.length} available now
+          </span>
+        </div>
+
+        {isUrgentLoading ? (
+          <p className="text-sm opacity-60">Scanning for immediate openings…</p>
+        ) : urgentMatches.length > 0 ? (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {urgentMatches.map((m) => (
+              <div key={m.salon_id} className="border border-line rounded-2xl p-4 bg-background/50 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <p className="font-semibold">{m.salon_name}</p>
+                      <p className="text-xs opacity-60">{m.distance_km != null ? `${m.distance_km} km away` : 'Nearby'} · 🚗 ~{m.travel_eta_mins} min travel</p>
+                    </div>
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-semibold whitespace-nowrap">
+                      In {m.starts_in_mins}m
+                    </span>
+                  </div>
+                  <div className="text-xs opacity-80 mt-2 space-y-0.5">
+                    <p>👤 {m.staff_name ? `Stylist: ${m.staff_name}` : 'Next available stylist'}</p>
+                    {m.instant_confirm_guaranteed && <p className="text-accent font-medium">⚡ Instant confirm guaranteed</p>}
+                    {m.flash_deal_discount_paise > 0 && (
+                      <p className="text-amber-400 font-medium">🏷️ Flash deal: Save {rupees(m.flash_deal_discount_paise)}</p>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-4 pt-3 border-t border-line flex items-center justify-between">
+                  <span className="font-semibold text-sm">{rupees(m.price_paise)}</span>
+                  <BookSalonButton salonId={m.salon_id} className="btn-accent !py-1.5 !px-4 text-xs font-medium">
+                    Book Slot
+                  </BookSalonButton>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-xs opacity-60">All immediate slots for the next 2 hours are currently booked. Browse standard salon availability below.</p>
+        )}
+      </section>
+
       <section>
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-display text-3xl">Salons near you</h2>
@@ -111,7 +177,16 @@ export default function Home() {
                     {s.live_queue.waiting_count > 0 ? `${s.live_queue.waiting_count} in walk-in queue` : 'No walk-in wait'}
                     <div>from {rupees(s.starting_price_paise)}</div>
                   </div>
-                  <BookSalonButton salonId={s.id}>Book</BookSalonButton>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setQueueSalon({ id: s.id, name: s.name, locality: s.locality })}
+                      className="px-3 py-1.5 rounded-full border border-line text-xs font-medium hover:border-accent hover:text-accent transition"
+                    >
+                      Join Queue
+                    </button>
+                    <BookSalonButton salonId={s.id}>Book</BookSalonButton>
+                  </div>
                 </div>
               </div>
             </div>
@@ -178,6 +253,10 @@ export default function Home() {
             </div>
           </section>
         </>
+      )}
+
+      {queueSalon && (
+        <WalkInQueueModal salon={queueSalon} onClose={() => setQueueSalon(null)} />
       )}
     </div>
   );

@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 import {
+  useAddonRecommendations,
   useAvailability,
   useCreateBooking,
   useCreatePaymentIntent,
@@ -49,6 +50,11 @@ export default function BookPage() {
   const activeSalonId = b.salonId ?? salons[0]?.id;
   const { data: profile, isLoading: loadingProfile } = useSalon(activeSalonId);
   const availability = useAvailability(activeSalonId, b.serviceIds, b.date, b.staffId);
+  const addons = useAddonRecommendations(activeSalonId, b.serviceIds, b.staffId);
+  const eligibleAddons = useMemo(
+    () => ((addons.data?.addons ?? (addons.data as any)?.recommendations ?? []) as typeof addons.data extends { addons: infer A } ? A : any[]).filter((a) => !b.serviceIds.includes(a.addon_service_id)),
+    [addons.data, b.serviceIds],
+  );
   const hold = useHold();
   const create = useCreateBooking();
   const capabilities = usePaymentCapabilities();
@@ -72,7 +78,9 @@ export default function BookPage() {
     () => (profile?.services ?? []).filter((s) => b.serviceIds.includes(s.id)),
     [profile, b.serviceIds],
   );
-  const total = selected.reduce((sum, s) => sum + (s.discounted_price_paise ?? s.base_price_paise), 0);
+  const subtotal = selected.reduce((sum, s) => sum + (s.discounted_price_paise ?? s.base_price_paise), 0);
+  const taxes = Math.round(subtotal * 0.18);
+  const total = subtotal + taxes;
   // With "Anyone" selected the API returns one slot per available artist, which
   // shows the same time twice. Collapse to unique start times; picking an artist
   // narrows the response to that artist anyway.
@@ -99,7 +107,11 @@ export default function BookPage() {
         staff_id: slot.staff_id,
         start_at: slot.start_at,
       });
-      const booking = await create.mutateAsync({ hold_token: held.hold_token, reminder_token: reminderToken });
+      const booking = await create.mutateAsync({
+        hold_token: held.hold_token,
+        reminder_token: reminderToken,
+        payment_mode: payMode,
+      });
       setConfirmation(booking);
       if (payMode === 'PAY_ONLINE') {
         try {
@@ -255,6 +267,42 @@ export default function BookPage() {
             ))}
           </div>
 
+          {eligibleAddons.length > 0 && (
+            <div className="p-3.5 rounded-2xl bg-surface-raised border border-line space-y-2">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-accent flex items-center gap-1.5">
+                  <span>✨</span> Add a smart add-on?
+                </span>
+                <span className="text-[10px] opacity-60">Bundle discount applied</span>
+              </div>
+              <div className="flex gap-2 overflow-x-auto pb-1">
+                {eligibleAddons.slice(0, 3).map((addon) => (
+                  <div
+                    key={addon.addon_service_id}
+                    className="min-w-[210px] flex-1 p-2.5 rounded-xl border border-line/60 bg-background/60 flex flex-col justify-between text-xs"
+                  >
+                    <div>
+                      <p className="font-medium truncate">{addon.name}</p>
+                      <p className="text-[10px] opacity-60 mt-0.5">
+                        +{addon.duration_mins} min · save {rupees(addon.bundle_discount_paise)}
+                      </p>
+                    </div>
+                    <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-line/40">
+                      <span className="font-mono font-semibold">{rupees(addon.bundle_price_paise)}</span>
+                      <button
+                        type="button"
+                        onClick={() => b.toggleService(addon.addon_service_id)}
+                        className="text-[11px] font-semibold text-accent hover:underline px-2 py-0.5 rounded-md hover:bg-accent/10 transition"
+                      >
+                        + Add
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="flex items-center gap-3">
             <input
               type="date"
@@ -304,7 +352,15 @@ export default function BookPage() {
                 <span>{rupees(s.discounted_price_paise ?? s.base_price_paise)}</span>
               </div>
             ))}
-            <div className="flex justify-between font-semibold border-t border-line pt-2 mt-2">
+            <div className="flex justify-between text-xs opacity-70 border-t border-line pt-2 mt-2">
+              <span>Subtotal</span>
+              <span>{rupees(subtotal)}</span>
+            </div>
+            <div className="flex justify-between text-xs opacity-70">
+              <span>Estimated Taxes (18% GST)</span>
+              <span>{rupees(taxes)}</span>
+            </div>
+            <div className="flex justify-between font-semibold border-t border-line pt-1 mt-1">
               <span>Total</span>
               <span>{rupees(total)}</span>
             </div>
